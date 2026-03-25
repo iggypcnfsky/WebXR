@@ -9,8 +9,38 @@ body {
 }
 
 .webgl {
-  position: fixed;
-  top: 0;
-  left: 0;
-  outline: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    outline: none;
+}
+
+.grid-controls {
+    position: fixed;
+    left: 12px;
+    bottom: 12px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    font: 13px system-ui, sans-serif;
+    color: #e8e8e8;
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 8px;
+    pointer-events: auto;
+    max-width: calc(100vw - 24px);
+}
+
+.grid-controls label {
+    white-space: nowrap;
+}
+
+.grid-controls input[type="range"] {
+    width: min(200px, 45vw);
+    vertical-align: middle;
+}
+
+.grid-controls-unit {
+    opacity: 0.75;
 }
