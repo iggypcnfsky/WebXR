@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import Menu from "lucide/dist/esm/icons/menu.js";
 import Pen from "lucide/dist/esm/icons/pen.js";
+import Rotate3d from "lucide/dist/esm/icons/rotate-3d.js";
 import Scan from "lucide/dist/esm/icons/scan.js";
 import { TubePainter } from "three/examples/jsm/misc/TubePainter.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
@@ -18,6 +19,23 @@ import {
   strokeWidthFromPressure,
 } from "./shared/sceneCodec.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
+import {
+  defaultPresenceLabel,
+  getOrCreateDeviceId,
+  getShowOthersPreference,
+  pruneStalePresencePeers,
+  setPresenceTargetsFromPayload,
+  setShowOthersPreference,
+  smoothPresencePeers,
+} from "./shared/sketcharPresence.js";
+import {
+  fetchRoomBySlug,
+  getSketcharSupabase,
+  isSketcharConfigured,
+  subscribeRoom,
+  upsertPin,
+  upsertSnapshot,
+} from "./shared/sketcharSupabase.js";
 
 /**
  * Lucide ESM icon → SVG element (viewBox 24×24).
@@ -43,15 +61,6 @@ function lucideIconToSvg(icon) {
     }
   }
   return svg;
-}
-
-const SKETCHAR_BASE = (import.meta.env.VITE_SKETCHAR_API ?? "").replace(
-  /\/$/,
-  "",
-);
-
-function apiUrl(path) {
-  return `${SKETCHAR_BASE}${path}`;
 }
 
 function newStrokeSyncId() {
@@ -83,6 +92,10 @@ const elAxisViewWrap = document.getElementById("axis-view-wrap");
 const btnAxisX = document.getElementById("btn-axis-view-x");
 const btnAxisY = document.getElementById("btn-axis-view-y");
 const btnAxisZ = document.getElementById("btn-axis-view-z");
+const elAutoOrbitWrap = document.getElementById("auto-orbit-wrap");
+const btnAutoOrbit = document.getElementById("btn-auto-orbit");
+const elAutoOrbitFabIcon = document.querySelector("#btn-auto-orbit .auto-orbit-fab-icon");
+if (elAutoOrbitFabIcon) elAutoOrbitFabIcon.appendChild(lucideIconToSvg(Rotate3d));
 
 const btnMenuToggle = document.getElementById("btn-menu-toggle");
 const elSettingsPanel = document.getElementById("settings-panel");
@@ -210,6 +223,27 @@ const contentGroup = new THREE.Group();
 alignmentGroup.add(contentGroup);
 scene.add(alignmentGroup);
 
+const remotePresenceGroup = new THREE.Group();
+remotePresenceGroup.name = "remote-presence";
+remotePresenceGroup.renderOrder = 1000;
+contentGroup.add(remotePresenceGroup);
+/** @type {Map<string, THREE.Group>} */
+const viewerRemotePeers = new Map();
+let viewerLastPresenceSmoothMs = performance.now();
+const viewerDeviceId = getOrCreateDeviceId();
+let viewerShowOthers = getShowOthersPreference();
+/** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
+let viewerRoomRealtime = null;
+let lastViewerPresenceSendMs = 0;
+const VIEWER_PRESENCE_SEND_MS = 120;
+const _vCamPosW = new THREE.Vector3();
+const _vCamQuatW = new THREE.Quaternion();
+const _vParentInv = new THREE.Quaternion();
+const _vCamLocalPos = new THREE.Vector3();
+const _vCamLocalQuat = new THREE.Quaternion();
+const _presenceSizeScratch = new THREE.Vector3();
+const _presenceStrokeBounds = new THREE.Box3();
+
 /** Ground plane grid at y=0 — sketch is framed so its bottom sits on the floor; origin is 0,0,0. */
 const GRID_SIZE = 8;
 const gridDivisions = isMobileViewer ? 20 : 40;
@@ -233,6 +267,20 @@ controls.target.set(0, 0, 0);
 controls.minDistance = 0.15;
 controls.maxDistance = 80;
 controls.update();
+
+/** OrbitControls `autoRotateSpeed` scale when auto-orbit is on (lower = slower; default Three.js is 2). */
+const AUTO_ORBIT_SPEED = 0.55;
+
+function setAutoOrbitUi(on) {
+  if (!btnAutoOrbit) return;
+  btnAutoOrbit.classList.toggle("active", on);
+  btnAutoOrbit.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+function disableAutoOrbit() {
+  controls.autoRotate = false;
+  setAutoOrbitUi(false);
+}
 
 /** @type {null | "X" | "Y" | "Z"} — set before syncOrbitWithGizmo (touch pan rule for Y plan). */
 let axisViewActive = null;
@@ -570,10 +618,9 @@ const arRig = new THREE.Group();
 arRig.position.set(0, 0, -1.35);
 
 let lastSnapshotKey = "";
-let pollTimer = 0;
 let pollBusy = false;
-
-const POLL_MS = isMobileViewer ? 1100 : 320;
+/** @type {string} */
+let viewerRoomId = "";
 
 /**
  * Cheap content fingerprint when `snapshotUpdatedAt` is missing — never JSON.stringify
@@ -766,18 +813,28 @@ function toggleAxisView(axis) {
 }
 
 function syncAxisViewFabVisibility() {
-  if (!elAxisViewWrap) return;
   const hide = getViewMode() === "ar" || renderer.xr.isPresenting;
-  elAxisViewWrap.hidden = hide;
-  if (hide) exitAxisViewIfNeeded();
+  if (elAxisViewWrap) {
+    elAxisViewWrap.hidden = hide;
+    if (hide) exitAxisViewIfNeeded();
+  }
+  if (elAutoOrbitWrap) {
+    elAutoOrbitWrap.hidden = hide;
+    if (hide) disableAutoOrbit();
+  }
 }
 
 /**
  * Place sketch so world origin is meaningful: center XZ at 0, bottom of bounds on y=0 (floor grid).
+ * Excludes `remotePresenceGroup` so orbit framing targets strokes only (presence is not part of the sketch).
  */
 function frameContentAtOrigin() {
   contentGroup.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(contentGroup);
+  const box = new THREE.Box3();
+  for (const ch of contentGroup.children) {
+    if (ch === remotePresenceGroup) continue;
+    box.expandByObject(ch);
+  }
   if (box.isEmpty()) {
     contentGroup.position.set(0, 0, 0);
     return;
@@ -786,6 +843,48 @@ function frameContentAtOrigin() {
   box.getCenter(center);
   contentGroup.position.set(-center.x, -box.min.y, -center.z);
   contentGroup.updateMatrixWorld(true);
+}
+
+/**
+ * Remote head/cone primitives are ~0.1 m; orbit cameras sit several meters away, so markers read as invisible.
+ * Scale presence to the stroke bounds (excluding presence) so peers stay visible in preview.
+ */
+function updateRemotePresenceViewerScale() {
+  _presenceStrokeBounds.makeEmpty();
+  for (const ch of contentGroup.children) {
+    if (ch === remotePresenceGroup) continue;
+    _presenceStrokeBounds.expandByObject(ch);
+  }
+  if (_presenceStrokeBounds.isEmpty()) {
+    remotePresenceGroup.scale.setScalar(1);
+    return;
+  }
+  const size = _presenceStrokeBounds.getSize(_presenceSizeScratch);
+  const maxDim = Math.max(size.x, size.y, size.z, 0.01);
+  const s = THREE.MathUtils.clamp(Math.max(2.4, maxDim * 0.16), 2.4, 18);
+  remotePresenceGroup.scale.setScalar(s);
+}
+
+/** Draw-through strokes so orange/blue markers are not lost behind thick tubes on preview. */
+function applyViewerPresenceRenderHints() {
+  remotePresenceGroup.traverse((o) => {
+    if (o instanceof THREE.Mesh || o instanceof THREE.Sprite) {
+      o.frustumCulled = false;
+      o.renderOrder = 1000;
+    }
+    const mats = o.material
+      ? Array.isArray(o.material)
+        ? o.material
+        : [o.material]
+      : [];
+    for (const m of mats) {
+      if (m) {
+        m.depthTest = false;
+        m.transparent = true;
+        m.needsUpdate = true;
+      }
+    }
+  });
 }
 
 /**
@@ -854,6 +953,7 @@ function collectObjectsInScreenRect(sel) {
   const out = [];
   const canvasRect = canvas.getBoundingClientRect();
   for (const ch of contentGroup.children) {
+    if (ch === remotePresenceGroup) continue;
     const bounds = getScreenBoundsForContentRoot(ch, canvasRect);
     if (bounds && rectsOverlap2D(sel, bounds)) out.push(ch);
   }
@@ -915,6 +1015,34 @@ function setMultiSelection(roots) {
   updateMultiSelectToolbarPosition();
 }
 
+function clearViewerRemotePeers() {
+  for (const g of viewerRemotePeers.values()) {
+    remotePresenceGroup.remove(g);
+    g.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
+        else o.material.dispose();
+      }
+    });
+  }
+  viewerRemotePeers.clear();
+}
+
+function handleViewerRemotePresence(p) {
+  if (!p || p.deviceId === viewerDeviceId) return;
+  if (!viewerShowOthers) return;
+  let g = viewerRemotePeers.get(p.deviceId);
+  if (!g) {
+    g = new THREE.Group();
+    g.name = `peer-${p.deviceId}`;
+    remotePresenceGroup.add(g);
+    viewerRemotePeers.set(p.deviceId, g);
+  }
+  g.userData.lastMs = performance.now();
+  setPresenceTargetsFromPayload(p, g);
+}
+
 function applyAlignmentPayload(alignment) {
   if (!alignment || alignment.matrix == null) {
     alignmentGroup.matrix.identity();
@@ -935,95 +1063,143 @@ function applyAlignmentPayload(alignment) {
   alignmentGroup.updateMatrixWorld(true);
 }
 
-async function pollRoom() {
-  const room = normalizeRoomCode(elRoom.value || "");
-  if (!room) {
-    setStatus("Enter a room code.", "err");
-    return;
+function stopViewerSubscription() {
+  if (viewerRoomRealtime) {
+    viewerRoomRealtime.unsubscribe();
+    viewerRoomRealtime = null;
   }
-  if (viewerStrokePosting) return;
-  if (stylusDrawActive) return;
-  if (pollBusy) return;
-  pollBusy = true;
-  try {
-    const r = await fetch(apiUrl(`/api/rooms/${encodeURIComponent(room)}`));
-    if (r.status === 404) {
-      setStatus(
-        "Room not found. Use the exact 4-character code from Quest (New room), or create a room first.",
-        "err",
-      );
+  lastViewerPresenceSendMs = 0;
+  clearViewerRemotePeers();
+}
+
+/** @param {{ snapshot?: unknown, snapshotUpdatedAt?: unknown, alignment?: unknown }} data */
+function applyRemoteRoomData(data) {
+  if (!data) return;
+  const remotePayload =
+    data.snapshot && data.snapshot.v === 1 && Array.isArray(data.snapshot.nodes)
+      ? data.snapshot
+      : { v: 1, nodes: [] };
+  if (!data.snapshot) {
+    setStatus("No drawing yet — enable Broadcast on Quest, then draw.", "");
+  }
+  const key = getSnapshotChangeKey(data);
+  if (key !== lastSnapshotKey) {
+    /* Do not replace the scene while a stroke is live — scene apply would invalidate TubePainter mid-drag (GPU crash). */
+    if (stylusDrawActive || viewerStrokePosting) {
       return;
     }
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    const remotePayload =
-      data.snapshot && data.snapshot.v === 1 && Array.isArray(data.snapshot.nodes)
-        ? data.snapshot
-        : { v: 1, nodes: [] };
-    if (!data.snapshot) {
-      setStatus("No drawing yet — enable Broadcast on Quest, then draw.", "");
-    }
-    const key = getSnapshotChangeKey(data);
-    if (key !== lastSnapshotKey) {
-      /* Do not replace the scene while a stroke is live — scene apply would invalidate TubePainter mid-drag (GPU crash). */
-      if (stylusDrawActive || viewerStrokePosting) {
-        return;
+    lastSnapshotKey = key;
+    /* Do not reset orbit target to origin — that “snaps” the view and has caused preview crashes on tablets. */
+    detachTransformKeepOrbitTarget();
+    try {
+      if (!viewerDidInitialFraming) {
+        contentGroup.position.set(0, 0, 0);
+        contentGroup.quaternion.identity();
+        contentGroup.scale.set(1, 1, 1);
       }
-      lastSnapshotKey = key;
-      /* Do not reset orbit target to origin — that “snaps” the view and has caused preview crashes on tablets. */
-      detachTransformKeepOrbitTarget();
+      const localPayload = serializeStrokesGroup(contentGroup);
+      const merged = mergeScenePayloadsForViewerPoll(
+        remotePayload,
+        localPayload,
+        viewerPendingSyncIds,
+      );
+      applyScenePayloadIncremental(merged, material, contentGroup);
+      if (!viewerDidInitialFraming) {
+        frameContentAtOrigin();
+        viewerDidInitialFraming = true;
+      }
+      if (getViewMode() === "align") {
+        applyAlignmentPayload(data.alignment);
+      } else {
+        alignmentGroup.matrix.identity();
+        alignmentGroup.matrixAutoUpdate = true;
+      }
+      controls.update();
+      setStatus("Updated.", "ok");
+    } catch (err) {
+      console.warn(err);
       try {
-        if (!viewerDidInitialFraming) {
-          contentGroup.position.set(0, 0, 0);
-          contentGroup.quaternion.identity();
-          contentGroup.scale.set(1, 1, 1);
-        }
-        const localPayload = serializeStrokesGroup(contentGroup);
-        const merged = mergeScenePayloadsForViewerPoll(
-          remotePayload,
-          localPayload,
-          viewerPendingSyncIds,
-        );
-        applyScenePayloadIncremental(merged, material, contentGroup);
-        if (!viewerDidInitialFraming) {
-          frameContentAtOrigin();
-          viewerDidInitialFraming = true;
-        }
-        if (getViewMode() === "align") {
-          applyAlignmentPayload(data.alignment);
-        } else {
-          alignmentGroup.matrix.identity();
-          alignmentGroup.matrixAutoUpdate = true;
-        }
-        controls.update();
-        setStatus("Updated.", "ok");
-      } catch (err) {
-        console.warn(err);
-        try {
-          applyScenePayloadIncremental({ v: 1, nodes: [] }, material, contentGroup);
-        } catch (_) {
-          /* ignore */
-        }
-        if (!viewerDidInitialFraming) {
-          frameContentAtOrigin();
-          viewerDidInitialFraming = true;
-        }
-        controls.update();
-        setStatus("Scene data error — check Quest broadcast.", "err");
+        applyScenePayloadIncremental({ v: 1, nodes: [] }, material, contentGroup);
+      } catch (_) {
+        /* ignore */
       }
+      if (!viewerDidInitialFraming) {
+        frameContentAtOrigin();
+        viewerDidInitialFraming = true;
+      }
+      controls.update();
+      setStatus("Scene data error — check Quest broadcast.", "err");
     }
+  }
+}
+
+async function refreshViewerRoomFromServer() {
+  const room = normalizeRoomCode(elRoom.value || "");
+  if (!room || !viewerRoomId) return;
+  if (viewerStrokePosting || stylusDrawActive) return;
+  if (pollBusy) return;
+  const sb = getSketcharSupabase();
+  if (!sb) return;
+  pollBusy = true;
+  try {
+    const data = await fetchRoomBySlug(sb, room);
+    if (!data) return;
+    applyRemoteRoomData(data);
   } catch (e) {
     console.warn(e);
-    setStatus("Fetch failed — is dev:api running?", "err");
+    setStatus("Realtime sync failed — check Supabase env.", "err");
   } finally {
     pollBusy = false;
   }
 }
 
-function startPoll() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollRoom();
-  pollTimer = setInterval(pollRoom, POLL_MS);
+function startRoomSync() {
+  stopViewerSubscription();
+  viewerRoomId = "";
+  const room = normalizeRoomCode(elRoom.value || "");
+  if (!room) {
+    setStatus("Enter a room code.", "err");
+    return;
+  }
+  if (!isSketcharConfigured()) {
+    setStatus("Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (build must include them).", "err");
+    return;
+  }
+  const sb = getSketcharSupabase();
+  if (!sb) {
+    setStatus("Supabase client unavailable.", "err");
+    return;
+  }
+  setStatus("Loading room…", "");
+  void (async () => {
+    pollBusy = true;
+    try {
+      const data = await fetchRoomBySlug(sb, room);
+      if (!data) {
+        setStatus(
+          "Room not found. Use the exact 4-character code from Quest (New room), or create a room first.",
+          "err",
+        );
+        return;
+      }
+      viewerRoomId = data.roomId;
+      applyRemoteRoomData(data);
+      viewerRoomRealtime = subscribeRoom(sb, data.roomId, {
+        onSnapshot: () => {
+          void refreshViewerRoomFromServer();
+        },
+        onAlignment: () => {
+          void refreshViewerRoomFromServer();
+        },
+        onPresence: handleViewerRemotePresence,
+      });
+    } catch (e) {
+      console.warn(e);
+      setStatus("Could not load room — check console / Supabase embed.", "err");
+    } finally {
+      pollBusy = false;
+    }
+  })();
 }
 
 elRoom.addEventListener("input", () => {
@@ -1033,10 +1209,10 @@ elRoom.addEventListener("change", () => {
   updateStylusDrawRoomAvailability();
   lastSnapshotKey = "";
   viewerDidInitialFraming = false;
-  startPoll();
+  startRoomSync();
 });
 elRoom.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") startPoll();
+  if (e.key === "Enter") startRoomSync();
 });
 
 for (const el of document.querySelectorAll('input[name="mode"]')) {
@@ -1046,7 +1222,7 @@ for (const el of document.querySelectorAll('input[name="mode"]')) {
     if (m) u.searchParams.set("mode", m);
     history.replaceState({}, "", u);
     lastSnapshotKey = "";
-    pollRoom();
+    void refreshViewerRoomFromServer();
     syncAxisViewFabVisibility();
   });
 }
@@ -1067,6 +1243,7 @@ function ensureSceneGraphFor2d() {
 
 function ensureSceneGraphForAr() {
   exitAxisViewIfNeeded();
+  disableAutoOrbit();
   controls.enabled = false;
   detachTransformClean();
   transformControl.visible = false;
@@ -1087,6 +1264,22 @@ function wireAxisViewButton(el, axis) {
 wireAxisViewButton(btnAxisX, "X");
 wireAxisViewButton(btnAxisY, "Y");
 wireAxisViewButton(btnAxisZ, "Z");
+
+btnAutoOrbit?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  if (getViewMode() !== "2d" && getViewMode() !== "align") return;
+  if (renderer.xr.isPresenting) return;
+  if (controls.autoRotate) {
+    disableAutoOrbit();
+    return;
+  }
+  controls.target.set(0, 0, 0);
+  controls.autoRotateSpeed = AUTO_ORBIT_SPEED;
+  controls.autoRotate = true;
+  controls.update();
+  setAutoOrbitUi(true);
+});
 
 btnAr.addEventListener("click", async () => {
   const mode = getViewMode();
@@ -1148,23 +1341,19 @@ btnPinPhone.addEventListener("click", async () => {
   const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
   p.addScaledVector(fwd, 0.45);
   try {
-    const r = await fetch(apiUrl(`/api/rooms/${encodeURIComponent(room)}/pin`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        device: "phone",
-        position: [p.x, p.y, p.z],
-      }),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
+    const sb = getSketcharSupabase();
+    if (!sb || !viewerRoomId) {
+      setStatus("Room not loaded — enter code and wait for sync.", "err");
+      return;
+    }
+    const j = await upsertPin(sb, viewerRoomId, "phone", [p.x, p.y, p.z]);
     setStatus(
       j.alignmentReady
         ? "Pins matched — alignment saved."
         : "Phone pin sent — waiting for Quest pin.",
       "ok",
     );
-    pollRoom();
+    void refreshViewerRoomFromServer();
   } catch (e) {
     console.warn(e);
     setStatus("Pin request failed.", "err");
@@ -1394,7 +1583,7 @@ updateStylusDrawRoomAvailability();
  */
 async function postViewerSnapshot(removedIds) {
   const room = normalizeRoomCode(elRoom.value || "");
-  if (!room) return;
+  if (!room || !viewerRoomId) return;
   const removedSet =
     removedIds instanceof Set
       ? removedIds
@@ -1405,12 +1594,10 @@ async function postViewerSnapshot(removedIds) {
 
   viewerStrokePosting = true;
   try {
-    const gr = await fetch(apiUrl(`/api/rooms/${encodeURIComponent(room)}`));
-    let remoteSnap = null;
-    if (gr.ok) {
-      const data = await gr.json();
-      remoteSnap = data.snapshot ?? null;
-    }
+    const sb = getSketcharSupabase();
+    if (!sb) throw new Error("supabase_unconfigured");
+    const roomData = await fetchRoomBySlug(sb, room);
+    let remoteSnap = roomData?.snapshot ?? null;
     const remote =
       remoteSnap && remoteSnap.v === 1 && Array.isArray(remoteSnap.nodes)
         ? remoteSnap
@@ -1419,15 +1606,7 @@ async function postViewerSnapshot(removedIds) {
       removedSet.size > 0
         ? mergeScenePayloadsWithRemovals(localPayload, remote, removedSet)
         : mergeScenePayloads(localPayload, remote);
-    const r = await fetch(
-      apiUrl(`/api/rooms/${encodeURIComponent(room)}/snapshot`),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payload: merged }),
-      },
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    await upsertSnapshot(sb, viewerRoomId, merged);
     for (const n of merged.nodes) {
       viewerPendingSyncIds.delete(nodeIdFromPayload(n));
     }
@@ -1435,7 +1614,7 @@ async function postViewerSnapshot(removedIds) {
     setStatus(removedSet.size > 0 ? "Scene updated." : "Stroke synced.", "ok");
   } catch (err) {
     console.warn(err);
-    setStatus("Stroke sync failed — is dev:api running?", "err");
+    setStatus("Stroke sync failed — check Supabase env.", "err");
   } finally {
     viewerStrokePosting = false;
   }
@@ -1722,9 +1901,56 @@ renderer.setAnimationLoop(() => {
   }
   applyWasdMovement();
   controls.update();
+
+  if (viewerRoomId && viewerRoomRealtime) {
+    const now = performance.now();
+    if (now - lastViewerPresenceSendMs >= VIEWER_PRESENCE_SEND_MS) {
+      lastViewerPresenceSendMs = now;
+      camera.getWorldPosition(_vCamPosW);
+      camera.getWorldQuaternion(_vCamQuatW);
+      contentGroup.updateMatrixWorld(true);
+      contentGroup.worldToLocal(_vCamLocalPos.copy(_vCamPosW));
+      contentGroup.getWorldQuaternion(_vParentInv);
+      _vParentInv.invert();
+      _vCamLocalQuat.copy(_vParentInv).multiply(_vCamQuatW);
+      viewerRoomRealtime.sendPresence({
+        deviceId: viewerDeviceId,
+        label: defaultPresenceLabel(),
+        mode: "viewer_camera",
+        x: _vCamLocalPos.x,
+        y: _vCamLocalPos.y,
+        z: _vCamLocalPos.z,
+        qx: _vCamLocalQuat.x,
+        qy: _vCamLocalQuat.y,
+        qz: _vCamLocalQuat.z,
+        qw: _vCamLocalQuat.w,
+      });
+    }
+  }
+  if (viewerRemotePeers.size > 0) {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - viewerLastPresenceSmoothMs) / 1000);
+    viewerLastPresenceSmoothMs = now;
+    smoothPresencePeers(viewerRemotePeers, dt);
+    updateRemotePresenceViewerScale();
+    applyViewerPresenceRenderHints();
+    remotePresenceGroup.visible = viewerShowOthers;
+    pruneStalePresencePeers(viewerRemotePeers, now, 6000);
+  }
+
   renderer.render(scene, camera);
 });
 
 syncAxisViewFabVisibility();
-startPoll();
-setStatus("Polling room…", "");
+
+const elViewerShowOthers = document.getElementById("viewer-show-others");
+if (elViewerShowOthers) {
+  elViewerShowOthers.checked = viewerShowOthers;
+  elViewerShowOthers.addEventListener("change", () => {
+    viewerShowOthers = elViewerShowOthers.checked;
+    setShowOthersPreference(viewerShowOthers);
+    remotePresenceGroup.visible = viewerShowOthers;
+  });
+}
+
+startRoomSync();

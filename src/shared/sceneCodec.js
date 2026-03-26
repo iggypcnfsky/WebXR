@@ -226,7 +226,7 @@ function serializeNode(o) {
     /** @type {Record<string, unknown>} */
     const out = {
       t: "stroke",
-      tr: decompose(o),
+      tr: snapStrokeTrIfNearIdentity(decompose(o)),
       points: pts.map((p) => [p.x, p.y, p.z]),
       strokeWidth:
         o.userData.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5,
@@ -258,6 +258,36 @@ function decompose(o) {
     q: [q.x, q.y, q.z, q.w],
     s: [s.x, s.y, s.z],
   };
+}
+
+/** Fresh strokes should serialize as identity transform; float noise in matrix.decompose breaks rebuild alignment. */
+function snapStrokeTrIfNearIdentity(tr) {
+  if (!tr || !tr.p || !tr.q || !tr.s) return tr;
+  const epsP = 1e-5;
+  const epsR = 1e-4;
+  const epsS = 1e-4;
+  const [px, py, pz] = tr.p;
+  const [qx, qy, qz, qw] = tr.q;
+  const [sx, sy, sz] = tr.s;
+  if (
+    Math.abs(px) < epsP &&
+    Math.abs(py) < epsP &&
+    Math.abs(pz) < epsP &&
+    Math.abs(qx) < epsR &&
+    Math.abs(qy) < epsR &&
+    Math.abs(qz) < epsR &&
+    (Math.abs(qw - 1) < epsR || Math.abs(qw + 1) < epsR) &&
+    Math.abs(sx - 1) < epsS &&
+    Math.abs(sy - 1) < epsS &&
+    Math.abs(sz - 1) < epsS
+  ) {
+    return {
+      p: [0, 0, 0],
+      q: [0, 0, 0, 1],
+      s: [1, 1, 1],
+    };
+  }
+  return tr;
 }
 
 function applyTr(obj, tr) {
@@ -312,6 +342,22 @@ function payloadsEqualSerialized(ser, node) {
   const a = normalizeSnapshotNode(ser);
   const b = normalizeSnapshotNode(node);
   return stableStringifyNode(a) === stableStringifyNode(b);
+}
+
+/**
+ * Compare two scene payloads ignoring top-level node order (merge uses Map insertion order).
+ * Use to skip applyScenePayloadIncremental when merge did not change anything vs local — avoids
+ * rebuilding TubePainter meshes in place (rebuild can shift strokes by float/tube tessellation).
+ */
+export function scenePayloadsEqual(a, b) {
+  if (!a || !b || a.v !== 1 || b.v !== 1) return false;
+  const na = [...(a.nodes || [])]
+    .map((n) => normalizeSnapshotNode(n))
+    .sort((x, y) => String(x.id).localeCompare(String(y.id)));
+  const nb = [...(b.nodes || [])]
+    .map((n) => normalizeSnapshotNode(n))
+    .sort((x, y) => String(x.id).localeCompare(String(y.id)));
+  return stableStringifyNode({ v: 1, nodes: na }) === stableStringifyNode({ v: 1, nodes: nb });
 }
 
 /**

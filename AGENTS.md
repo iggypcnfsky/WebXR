@@ -13,7 +13,7 @@
 
 - Documented GitHub remote for this project: `https://github.com/iggypcnfsky/WebXR.git`.
 - WebXR behavior, drawing, and input handling live primarily in `src/script.js` (Three.js, `TubePainter`, MX Ink controller profile `logitech-mx-ink`). Live phone/tablet preview is `src/viewer.html` + `src/viewer.js` + `src/viewer.css` (separate bundle).
-- Scene sync / Sketchar: `src/shared/sceneCodec.js` (`serializeStrokesGroup`, `deserializeSceneV1`, `mergeScenePayloads`, incremental `applyScenePayloadIncremental`); room HTTP in `server/index.mjs`. Strokes use `userData.syncId` for merge-by-id across clients.
+- Scene sync / Sketchar: `src/shared/sceneCodec.js` (`serializeStrokesGroup`, `deserializeSceneV1`, `mergeScenePayloads`, incremental `applyScenePayloadIncremental`); Supabase rooms + Realtime in `src/shared/sketcharSupabase.js` (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`). Strokes use `userData.syncId` for merge-by-id across clients.
 - Room codes are normalized with `src/shared/roomCode.js` (`normalizeRoomCode`); API room lookup is case-insensitive so rejoin with the same code works regardless of casing.
 - After moving `sceneContentRoot`, stroke tip positions must be converted **world → mesh-local** before `TubePainter` `moveTo`/`lineTo` so tubes match the pen (parent transforms are not identity).
 - One lattice drives both visuals and snap: `cellSize = GRID_WORLD_EXTENT / gridLattice.divisions`; vertex snap matches the same spacing as the grid helpers/markers (origin-centered extent with half-size + integer × step).

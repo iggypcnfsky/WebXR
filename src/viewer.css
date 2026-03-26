@@ -28,7 +28,8 @@ body {
 }
 .stylus-fab-wrap,
 .select-mode-wrap,
-.axis-view-wrap {
+.axis-view-wrap,
+.auto-orbit-wrap {
   position: relative;
   pointer-events: auto;
 }
@@ -87,6 +88,15 @@ body {
   height: 26px;
 }
 .select-fab-icon svg {
+  width: 100%;
+  height: 100%;
+}
+.auto-orbit-fab-icon {
+  display: flex;
+  width: 26px;
+  height: 26px;
+}
+.auto-orbit-fab-icon svg {
   width: 100%;
   height: 100%;
 }
@@ -324,6 +334,13 @@ body {
 .row button.active {
   background: rgba(70, 140, 95, 0.55);
   border-color: rgba(160, 220, 180, 0.45);
+}
+
+.viewer-show-others {
+  display: block;
+  margin-top: 8px;
+  font-size: 0.9rem;
+  cursor: pointer;
 }
 
 .status-bar {

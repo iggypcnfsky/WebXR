@@ -8,7 +8,7 @@
 </head>
 <body>
     <canvas class="webgl"></canvas>
-    <div id="sketchar-panel" class="sketchar-panel" title="Live preview: push scene to Neon for phone viewers">
+    <div id="sketchar-panel" class="sketchar-panel" title="Live preview: sync scene to Supabase for phone viewers">
         <div class="sketchar-title">Sketchar</div>
         <div class="sketchar-row">
             <input type="text" id="sketchar-slug" placeholder="e.g. A3Z9" maxlength="12" autocomplete="off" spellcheck="false" />
@@ -16,12 +16,13 @@
             <button type="button" id="sketchar-join">Use code</button>
         </div>
         <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-broadcast" /> Broadcast scene</label>
+        <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-show-others" checked /> Show other devices</label>
         <div class="sketchar-row">
             <button type="button" id="sketchar-pin-quest">Send alignment pin</button>
             <button type="button" id="sketchar-copy">Copy viewer link</button>
         </div>
         <div id="sketchar-viewer-link" class="sketchar-link">—</div>
-        <div id="sketchar-status" class="sketchar-status">Sketchar: idle (run npm run dev:api)</div>
+        <div id="sketchar-status" class="sketchar-status">Sketchar: idle (set VITE_SUPABASE_* in .env.local)</div>
     </div>
     <div id="grid-controls" class="grid-controls" title="Cell size for drawing and grab snap (when grid mode is on)">
         <label for="grid-cell-slider">Grid cell</label>

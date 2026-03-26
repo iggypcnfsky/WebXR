@@ -8,18 +8,13 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
 export default {
   root: "src/", // Sources files (typically where index.html is)
+  /** Load `.env` / `.env.local` from repo root (next to this file), not from `src/`. */
+  envDir: __dirname,
   publicDir: "../static/", // Path from "root" to static assets (files that are served as they are)
   server: {
     host: true, // Open to local network and display URL
     open: !("SANDBOX_URL" in process.env || "CODESANDBOX_HOST" in process.env), // Open if it's not a CodeSandbox
     https: true,
-    proxy: {
-      "/api": {
-        target: "http://127.0.0.1:3001",
-        changeOrigin: true,
-        secure: false,
-      },
-    },
   },
   build: {
     outDir: "../dist", // Output in the dist/ folder

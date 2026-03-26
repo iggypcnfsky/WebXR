@@ -16,9 +16,30 @@ import {
   applyScenePayloadIncremental,
   deserializeSceneV1,
   mergeScenePayloads,
+  mergeScenePayloadsForViewerPoll,
+  nodeIdFromPayload,
+  scenePayloadsEqual,
   serializeStrokesGroup,
 } from "./shared/sceneCodec.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
+import {
+  defaultPresenceLabel,
+  getOrCreateDeviceId,
+  getShowOthersPreference,
+  pruneStalePresencePeers,
+  setPresenceTargetsFromPayload,
+  setShowOthersPreference,
+  smoothPresencePeers,
+} from "./shared/sketcharPresence.js";
+import {
+  createRoom,
+  fetchRoomBySlug,
+  getSketcharSupabase,
+  isSketcharConfigured,
+  subscribeRoom,
+  upsertPin,
+  upsertSnapshot,
+} from "./shared/sketcharSupabase.js";
 
 let camera, scene, renderer;
 let controller1, controller2;
@@ -36,6 +57,14 @@ const strokesGroup = new THREE.Group();
 /** Parent for drawable content + grid; transformed by thumb–middle scene manip (HUD/controllers stay on scene). */
 const sceneContentRoot = new THREE.Group();
 sceneContentRoot.name = "scene-content-root";
+
+const remotePresenceGroup = new THREE.Group();
+remotePresenceGroup.name = "remote-presence";
+/** @type {Map<string, THREE.Group>} */
+const sketcharRemotePeers = new Map();
+const sketcharDeviceId = getOrCreateDeviceId();
+let sketcharShowOthers = getShowOthersPreference();
+let lastPresenceSmoothMs = performance.now();
 
 const sm_middleTip = new THREE.Vector3();
 /** @type {"none"|"one"|"two"} */
@@ -92,25 +121,86 @@ const smSlotR = {
   anchor: new THREE.Vector3(),
 };
 
-/** Sketchar: live snapshot sync to Neon (see server/index.mjs). */
-const SKETCHAR_BASE = (import.meta.env.VITE_SKETCHAR_API ?? "").replace(/\/$/, "");
+/** Sketchar: Supabase Postgres + Realtime (see src/shared/sketcharSupabase.js). */
 let sketcharRoomSlug = "";
+/** @type {string} */
+let sketcharRoomId = "";
 let sketcharBroadcast = false;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let sketcharPushTimer = null;
-/** @type {ReturnType<typeof setInterval> | null} */
-let sketcharPollTimer = null;
+/** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
+let sketcharRoomRealtime = null;
 /** @type {string | null} */
 let lastSketcharRemoteSeen = null;
+/** Stroke syncIds from Quest not yet confirmed by a successful upsert (see mergeScenePayloadsForViewerPoll). */
+const sketcharPendingSyncIds = new Set();
 let sketcharPollBusy = false;
-/** Set when a remote poll was skipped while drawing/grabbing; flushed once idle. */
+/** Set when a remote update was skipped while drawing/grabbing; flushed once idle. */
 let sketcharPollDeferred = false;
 
-/** Full-scene rebuild was blocking XR for large rooms; incremental apply + lower poll rate. */
-const SKETCHAR_POLL_MS = 4000;
+let lastSketcharPresenceSendMs = 0;
+const SKETCHAR_PRESENCE_SEND_MS = 100;
+const _questHeadWorld = new THREE.Vector3();
+const _questHeadLocal = new THREE.Vector3();
 
-function sketcharApiUrl(path) {
-  return `${SKETCHAR_BASE}${path}`;
+function clearSketcharRemotePeers() {
+  for (const g of sketcharRemotePeers.values()) {
+    remotePresenceGroup.remove(g);
+    g.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
+        else o.material.dispose();
+      }
+    });
+  }
+  sketcharRemotePeers.clear();
+}
+
+function handleSketcharRemotePresence(p) {
+  if (!p || p.deviceId === sketcharDeviceId) return;
+  if (!sketcharShowOthers) return;
+  let g = sketcharRemotePeers.get(p.deviceId);
+  if (!g) {
+    g = new THREE.Group();
+    g.name = `peer-${p.deviceId}`;
+    remotePresenceGroup.add(g);
+    sketcharRemotePeers.set(p.deviceId, g);
+  }
+  g.userData.lastMs = performance.now();
+  setPresenceTargetsFromPayload(p, g);
+}
+
+function stopSketcharSubscription() {
+  if (sketcharRoomRealtime) {
+    sketcharRoomRealtime.unsubscribe();
+    sketcharRoomRealtime = null;
+  }
+  lastSketcharPresenceSendMs = 0;
+  clearSketcharRemotePeers();
+}
+
+function startSketcharSubscription() {
+  stopSketcharSubscription();
+  if (!sketcharRoomId) return;
+  const sb = getSketcharSupabase();
+  if (!sb) return;
+  sketcharRoomRealtime = subscribeRoom(sb, sketcharRoomId, {
+    onSnapshot: (ev) => {
+      void handleSketcharRemoteSnapshot(ev);
+    },
+    onAlignment: () => {},
+    onPresence: handleSketcharRemotePresence,
+  });
+}
+
+/** Same DB instant can appear as different ISO strings (Realtime vs REST). */
+function sketcharSnapshotTimeMatches(incoming, lastSeen) {
+  if (incoming == null || lastSeen == null) return false;
+  const a = Date.parse(String(incoming));
+  const b = Date.parse(String(lastSeen));
+  if (Number.isFinite(a) && Number.isFinite(b)) return a === b;
+  return String(incoming) === String(lastSeen);
 }
 
 function scheduleSketcharPush() {
@@ -123,7 +213,7 @@ function scheduleSketcharPush() {
 }
 
 async function pushSketcharSnapshot() {
-  if (!sketcharBroadcast || !sketcharRoomSlug) return;
+  if (!sketcharBroadcast || !sketcharRoomSlug || !sketcharRoomId) return;
   if (shouldDeferSketcharSceneApply()) {
     scheduleSketcharPush();
     return;
@@ -131,37 +221,26 @@ async function pushSketcharSnapshot() {
   strokesGroup.updateMatrixWorld(true);
   const statusEl = document.getElementById("sketchar-status");
   try {
+    const sb = getSketcharSupabase();
+    if (!sb) throw new Error("supabase_unconfigured");
     let remoteSnapshot = null;
-    /** @type {string | null} */
-    let snapshotAtFromGet = null;
-    const gr = await fetch(
-      sketcharApiUrl(`/api/rooms/${encodeURIComponent(sketcharRoomSlug)}`),
-    );
-    if (gr.ok) {
-      const data = await gr.json();
-      remoteSnapshot = data.snapshot ?? null;
-      if (data.snapshotUpdatedAt != null) {
-        snapshotAtFromGet = String(data.snapshotUpdatedAt);
-      }
-    }
+    const roomData = await fetchRoomBySlug(sb, sketcharRoomSlug);
+    if (roomData) remoteSnapshot = roomData.snapshot ?? null;
     if (shouldDeferSketcharSceneApply()) {
       scheduleSketcharPush();
       return;
     }
     const localPayload = serializeStrokesGroup(strokesGroup);
     const merged = mergeScenePayloads(localPayload, remoteSnapshot);
-    applyScenePayloadIncremental(merged, material, strokesGroup);
+    if (!scenePayloadsEqual(localPayload, merged)) {
+      applyScenePayloadIncremental(merged, material, strokesGroup);
+    }
     strokesGroup.updateMatrixWorld(true);
-    const r = await fetch(
-      sketcharApiUrl(`/api/rooms/${encodeURIComponent(sketcharRoomSlug)}/snapshot`),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payload: merged }),
-      },
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    if (snapshotAtFromGet != null) lastSketcharRemoteSeen = snapshotAtFromGet;
+    const { updatedAt } = await upsertSnapshot(sb, sketcharRoomId, merged);
+    for (const n of merged.nodes) {
+      sketcharPendingSyncIds.delete(nodeIdFromPayload(n));
+    }
+    if (updatedAt != null) lastSketcharRemoteSeen = String(updatedAt);
     if (statusEl) {
       statusEl.textContent = "Sketchar: synced";
       statusEl.dataset.state = "ok";
@@ -175,47 +254,93 @@ async function pushSketcharSnapshot() {
   }
 }
 
-async function pollSketcharRemote() {
+/**
+ * @param {{ payload?: unknown, updatedAt?: string | null }} ev
+ */
+async function handleSketcharRemoteSnapshot(ev) {
   if (!sketcharRoomSlug || sketcharPollBusy) return;
-  if (shouldDeferSketcharSceneApply()) return;
+  if (shouldDeferSketcharSceneApply()) {
+    sketcharPollDeferred = true;
+    return;
+  }
   sketcharPollBusy = true;
   try {
-    const r = await fetch(
-      sketcharApiUrl(`/api/rooms/${encodeURIComponent(sketcharRoomSlug)}`),
+    const at = ev.updatedAt != null ? String(ev.updatedAt) : null;
+    if (
+      at != null &&
+      lastSketcharRemoteSeen != null &&
+      sketcharSnapshotTimeMatches(at, lastSketcharRemoteSeen)
+    ) {
+      sketcharPollDeferred = false;
+      return;
+    }
+    const remoteSnapshot = ev.payload ?? null;
+    if (shouldDeferSketcharSceneApply()) {
+      sketcharPollDeferred = true;
+      return;
+    }
+    strokesGroup.updateMatrixWorld(true);
+    const localPayload = serializeStrokesGroup(strokesGroup);
+    const merged = mergeScenePayloadsForViewerPoll(
+      remoteSnapshot,
+      localPayload,
+      sketcharPendingSyncIds,
     );
-    if (!r.ok) return;
-    const data = await r.json();
+    if (!scenePayloadsEqual(localPayload, merged)) {
+      applyScenePayloadIncremental(merged, material, strokesGroup);
+    }
+    strokesGroup.updateMatrixWorld(true);
+    if (at !== null) lastSketcharRemoteSeen = at;
+    sketcharPollDeferred = false;
+  } catch (e) {
+    console.warn("Sketchar remote failed", e);
+  } finally {
+    sketcharPollBusy = false;
+  }
+}
+
+async function flushSketcharRemote() {
+  if (!sketcharRoomSlug || sketcharPollBusy) return;
+  if (shouldDeferSketcharSceneApply()) return;
+  const sb = getSketcharSupabase();
+  if (!sb) return;
+  sketcharPollBusy = true;
+  try {
+    const data = await fetchRoomBySlug(sb, sketcharRoomSlug);
+    if (!data) return;
     if (shouldDeferSketcharSceneApply()) {
       sketcharPollDeferred = true;
       return;
     }
     const at =
       data.snapshotUpdatedAt != null ? String(data.snapshotUpdatedAt) : null;
-    if (at !== null && at === lastSketcharRemoteSeen) {
+    if (
+      at != null &&
+      lastSketcharRemoteSeen != null &&
+      sketcharSnapshotTimeMatches(at, lastSketcharRemoteSeen)
+    ) {
       sketcharPollDeferred = false;
       return;
     }
     const remoteSnapshot = data.snapshot ?? null;
     strokesGroup.updateMatrixWorld(true);
     const localPayload = serializeStrokesGroup(strokesGroup);
-    const merged = mergeScenePayloads(localPayload, remoteSnapshot);
-    applyScenePayloadIncremental(merged, material, strokesGroup);
+    const merged = mergeScenePayloadsForViewerPoll(
+      remoteSnapshot,
+      localPayload,
+      sketcharPendingSyncIds,
+    );
+    if (!scenePayloadsEqual(localPayload, merged)) {
+      applyScenePayloadIncremental(merged, material, strokesGroup);
+    }
     strokesGroup.updateMatrixWorld(true);
     if (at !== null) lastSketcharRemoteSeen = at;
     sketcharPollDeferred = false;
   } catch (e) {
-    console.warn("Sketchar poll failed", e);
+    console.warn("Sketchar flush failed", e);
   } finally {
     sketcharPollBusy = false;
   }
-}
-
-function startSketcharPoll() {
-  if (sketcharPollTimer) clearInterval(sketcharPollTimer);
-  sketcharPollTimer = null;
-  if (!sketcharRoomSlug) return;
-  pollSketcharRemote();
-  sketcharPollTimer = setInterval(pollSketcharRemote, SKETCHAR_POLL_MS);
 }
 
 function initSketcharUI() {
@@ -232,29 +357,43 @@ function initSketcharUI() {
     sketcharBroadcast = elBroadcast.checked;
     elBroadcast.addEventListener("change", () => {
       sketcharBroadcast = elBroadcast.checked;
-      if (sketcharBroadcast) scheduleSketcharPush();
+      if (sketcharBroadcast) {
+        scheduleSketcharPush();
+      }
+    });
+  }
+  const elShowOthers = document.getElementById("sketchar-show-others");
+  if (elShowOthers) {
+    elShowOthers.checked = sketcharShowOthers;
+    elShowOthers.addEventListener("change", () => {
+      sketcharShowOthers = elShowOthers.checked;
+      setShowOthersPreference(sketcharShowOthers);
+      remotePresenceGroup.visible = sketcharShowOthers;
     });
   }
   if (elCreate) {
     elCreate.addEventListener("click", async () => {
+      if (!isSketcharConfigured()) {
+        alert(
+          "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+        );
+        return;
+      }
+      const sb = getSketcharSupabase();
+      if (!sb) return;
       try {
-        const r = await fetch(sketcharApiUrl("/api/rooms"), { method: "POST" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const data = await r.json();
-        const code =
-          typeof data.slug === "string" ? data.slug.trim() : "";
-        if (code.length !== 4) {
-          console.warn("Sketchar: expected 4-char slug, got:", data);
-          throw new Error("bad_room_code");
-        }
-        sketcharRoomSlug = normalizeRoomCode(code);
+        const { id, slug } = await createRoom(sb);
+        stopSketcharSubscription();
+        sketcharRoomId = id;
+        sketcharRoomSlug = normalizeRoomCode(slug);
         elSlug.value = sketcharRoomSlug;
         lastSketcharRemoteSeen = null;
+        sketcharPendingSyncIds.clear();
         updateSketcharViewerLink(elViewerLink);
-        startSketcharPoll();
+        startSketcharSubscription();
       } catch (e) {
         console.warn("Sketchar create room failed", e);
-        alert("Could not create room. Is the API running? (npm run dev:api)");
+        alert("Could not create room. Check Supabase env and project.");
       }
     });
   }
@@ -265,12 +404,18 @@ function initSketcharUI() {
         alert("Enter a room code.");
         return;
       }
+      if (!isSketcharConfigured()) {
+        alert(
+          "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+        );
+        return;
+      }
+      const sb = getSketcharSupabase();
+      if (!sb) return;
       const statusEl = document.getElementById("sketchar-status");
       try {
-        const r = await fetch(
-          sketcharApiUrl(`/api/rooms/${encodeURIComponent(normalized)}`),
-        );
-        if (r.status === 404) {
+        const data = await fetchRoomBySlug(sb, normalized);
+        if (!data) {
           if (statusEl) {
             statusEl.textContent = "Sketchar: room not found";
             statusEl.dataset.state = "err";
@@ -279,12 +424,9 @@ function initSketcharUI() {
           }
           return;
         }
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const data = await r.json();
-        const canonical =
-          typeof data.slug === "string" && data.slug.trim()
-            ? normalizeRoomCode(data.slug)
-            : normalized;
+        stopSketcharSubscription();
+        sketcharRoomId = data.roomId;
+        const canonical = normalizeRoomCode(data.slug);
         sketcharRoomSlug = canonical;
         elSlug.value = canonical;
         currentStrokePainter = null;
@@ -295,10 +437,11 @@ function initSketcharUI() {
         } else {
           deserializeSceneV1({ v: 1, nodes: [] }, material, strokesGroup);
         }
+        sketcharPendingSyncIds.clear();
         lastSketcharRemoteSeen =
           data.snapshotUpdatedAt != null ? String(data.snapshotUpdatedAt) : null;
         updateSketcharViewerLink(elViewerLink);
-        startSketcharPoll();
+        startSketcharSubscription();
         if (statusEl) {
           statusEl.textContent = data.snapshot
             ? "Sketchar: room loaded from cloud"
@@ -311,7 +454,7 @@ function initSketcharUI() {
           statusEl.textContent = "Sketchar: could not load room";
           statusEl.dataset.state = "err";
         } else {
-          alert("Could not load room. Is the API running?");
+          alert("Could not load room. Check Supabase env.");
         }
       }
     });
@@ -329,23 +472,14 @@ function initSketcharUI() {
   }
   if (elPinQuest) {
     elPinQuest.addEventListener("click", async () => {
-      if (!sketcharRoomSlug) return;
+      if (!sketcharRoomSlug || !sketcharRoomId) return;
+      const sb = getSketcharSupabase();
+      if (!sb) return;
       const p = new THREE.Vector3();
       if (stylus && stylus.position) p.copy(stylus.position);
       else camera.getWorldPosition(p);
       try {
-        const r = await fetch(
-          sketcharApiUrl(`/api/rooms/${encodeURIComponent(sketcharRoomSlug)}/pin`),
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              device: "quest",
-              position: [p.x, p.y, p.z],
-            }),
-          },
-        );
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        await upsertPin(sb, sketcharRoomId, "quest", [p.x, p.y, p.z]);
       } catch (e) {
         console.warn("Sketchar pin failed", e);
       }
@@ -517,8 +651,6 @@ const GRID_DOT_RADIUS = 0.0018;
 /** Visual-only: place dots every Nth lattice step along each axis (snap math unchanged). */
 const GRID_DOT_VERTEX_STRIDE = 2;
 const PICK_PROXIMITY_MAX_DIST = 0.35;
-/** Endpoints closer than this (m) link strokes into one cluster (same grab object; separate meshes). */
-const MERGE_STROKE_DIST = 0.048;
 /**
  * MX Ink → WebXR Gamepad (Quest). Logitech OpenXR: cluster_front=click, cluster_middle=force, tip=force.
  * This app: draw = middle (force), erase = front (click). On Quest Browser, cluster_front is usually buttons[0], not [2].
@@ -1265,16 +1397,15 @@ function emitManhattanSnapSegments(painter, strokeWidth, p0Ref, p1) {
 }
 
 /**
- * TubePainter writes buffer positions in mesh space; MX Ink gives world-space tip positions.
- * Must match `appendStrokePointWorld` (used for userData.points / serialize) or strokes drift until rebuild.
+ * TubePainter builds geometry in mesh-local space; mesh is a direct child of `strokesGroup` at origin while drawing.
+ * Use strokesGroup (not mesh) for world→local so sampling matches serialization and is not affected by mesh matrix drift.
+ * Must match `appendStrokePointWorld` (userData.points / sceneCodec).
  */
 function strokeMeshLocalFromWorld(out, worldVec) {
   if (!currentStrokePainter) return out.set(0, 0, 0);
-  const mesh = currentStrokePainter.mesh;
   strokesGroup.updateMatrixWorld(true);
-  mesh.updateMatrixWorld(true);
   out.copy(worldVec);
-  mesh.worldToLocal(out);
+  strokesGroup.worldToLocal(out);
   return out;
 }
 
@@ -1374,6 +1505,7 @@ function init() {
   grid3dGroupRef.visible = snapToGridEnabled;
   sceneContentRoot.add(strokesGroup);
   sceneContentRoot.add(grid3dGroupRef);
+  sceneContentRoot.add(remotePresenceGroup);
   scene.add(sceneContentRoot);
   initGridLatticeFromSliderDom();
   rebuildGrid3dVisuals();
@@ -2338,101 +2470,12 @@ function buildStrokeMeshFromPoints(pointsLocal, strokeWidth) {
   return tp.mesh;
 }
 
-function tryBuildMergedWorldPolyline(meshA, meshB) {
-  const pa = meshA.userData.points;
-  const pb = meshB.userData.points;
-  if (!pa || !pb || pa.length < 2 || pb.length < 2) return null;
-
-  const worldA = pa.map((p) => meshA.localToWorld(p.clone()));
-  const worldB = pb.map((p) => meshB.localToWorld(p.clone()));
-
-  const nA = worldA.length;
-  const nB = worldB.length;
-  const a0 = worldA[0];
-  const a1 = worldA[nA - 1];
-  const b0 = worldB[0];
-  const b1 = worldB[nB - 1];
-
-  const candidates = [
-    { d: a1.distanceTo(b0), build: () => [...worldA, ...worldB] },
-    { d: a1.distanceTo(b1), build: () => [...worldA, ...worldB.slice().reverse()] },
-    { d: a0.distanceTo(b0), build: () => [...worldA.slice().reverse(), ...worldB] },
-    { d: a0.distanceTo(b1), build: () => [...worldB, ...worldA] },
-  ];
-
-  candidates.sort((x, y) => x.d - y.d);
-  const best = candidates[0];
-  if (best.d > MERGE_STROKE_DIST) return null;
-
-  return best.build();
-}
-
 function invalidateStrokeClusterCenters(node) {
   let p = node;
   while (p) {
     if (p.userData && p.userData.isStrokeCluster) delete p.userData.centerLocal;
     p = p.parent;
   }
-}
-
-function areSameStrokeCluster(a, b) {
-  if (a === b) return true;
-  if (a.parent && a.parent.userData && a.parent.userData.isStrokeCluster && a.parent === b.parent) return true;
-  return false;
-}
-
-function findProximityStrokePartner(mesh) {
-  if (!mesh.userData.points || mesh.userData.points.length < 2) return null;
-  const candidates = [];
-  strokesGroup.traverse((o) => {
-    if (!o.isMesh || o === mesh) return;
-    if (!o.userData.points || o.userData.points.length < 2) return;
-    if (areSameStrokeCluster(o, mesh)) return;
-    candidates.push(o);
-  });
-  for (const other of candidates) {
-    if (tryBuildMergedWorldPolyline(mesh, other)) return other;
-  }
-  return null;
-}
-
-/** Link endpoint-near strokes into one `THREE.Group` (same grab object; meshes stay separate). */
-function linkStrokeClusterIfNeeded(mesh) {
-  const other = findProximityStrokePartner(mesh);
-  if (!other) return;
-
-  if (areSameStrokeCluster(mesh, other)) return;
-
-  if (other.parent && other.parent.userData && other.parent.userData.isStrokeCluster) {
-    const g = other.parent;
-    if (mesh.parent !== g) {
-      if (mesh.parent) mesh.parent.remove(mesh);
-      else strokesGroup.remove(mesh);
-      g.attach(mesh);
-      invalidateStrokeClusterCenters(g);
-    }
-    return;
-  }
-
-  if (mesh.parent && mesh.parent.userData && mesh.parent.userData.isStrokeCluster) {
-    const g = mesh.parent;
-    if (other.parent !== g) {
-      if (other.parent) other.parent.remove(other);
-      else strokesGroup.remove(other);
-      g.attach(other);
-      invalidateStrokeClusterCenters(g);
-    }
-    return;
-  }
-
-  const group = new THREE.Group();
-  group.userData.isStrokeCluster = true;
-  strokesGroup.remove(mesh);
-  strokesGroup.remove(other);
-  strokesGroup.add(group);
-  group.attach(mesh);
-  group.attach(other);
-  invalidateStrokeClusterCenters(group);
 }
 
 function eraseStrokeAtWorld(mesh, eraseWorldPt) {
@@ -3094,12 +3137,12 @@ function animate(time, frame) {
     mesh.userData.points = currentStrokePointsLocal.map((p) => p.clone());
     delete mesh.userData.centerLocal;
     mesh.userData.syncId = crypto.randomUUID();
+    sketcharPendingSyncIds.add(mesh.userData.syncId);
     currentStrokePainter = null;
     currentStrokePointsLocal.length = 0;
-    linkStrokeClusterIfNeeded(mesh);
     pushCompletedStrokeForBlockMode(mesh);
     scheduleSketcharPush();
-    if (sketcharPollDeferred) pollSketcharRemote();
+    if (sketcharPollDeferred) void flushSketcharRemote();
   }
 
   if (frame && renderer.xr.isPresenting) {
@@ -3124,7 +3167,7 @@ function animate(time, frame) {
     prevGrabModeForSketchar !== "none" &&
     sketcharPollDeferred
   ) {
-    pollSketcharRemote();
+    void flushSketcharRemote();
   }
   prevGrabModeForSketchar = grabMode;
 
@@ -3134,6 +3177,40 @@ function animate(time, frame) {
   if (grid3dGroupRef) {
     grid3dGroupRef.visible = snapToGridEnabled;
     updateGridDotsInkUniform();
+  }
+
+  if (frame && renderer.xr.isPresenting && sketcharBroadcast && sketcharRoomRealtime) {
+    const t = performance.now();
+    if (t - lastSketcharPresenceSendMs >= SKETCHAR_PRESENCE_SEND_MS) {
+      lastSketcharPresenceSendMs = t;
+      const refSpace = renderer.xr.getReferenceSpace();
+      if (refSpace) {
+        const pose = frame.getViewerPose(refSpace);
+        if (pose) {
+          const p = pose.transform.position;
+          _questHeadWorld.set(p.x, p.y, p.z);
+          strokesGroup.updateMatrixWorld(true);
+          strokesGroup.worldToLocal(_questHeadLocal.copy(_questHeadWorld));
+          sketcharRoomRealtime.sendPresence({
+            deviceId: sketcharDeviceId,
+            label: defaultPresenceLabel(),
+            mode: "xr_head",
+            x: _questHeadLocal.x,
+            y: _questHeadLocal.y,
+            z: _questHeadLocal.z,
+          });
+        }
+      }
+    }
+  }
+
+  if (sketcharRemotePeers.size > 0) {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - lastPresenceSmoothMs) / 1000);
+    lastPresenceSmoothMs = now;
+    smoothPresencePeers(sketcharRemotePeers, dt);
+    remotePresenceGroup.visible = sketcharShowOthers;
+    pruneStalePresencePeers(sketcharRemotePeers, now, 6000);
   }
 
   renderer.render(scene, camera);

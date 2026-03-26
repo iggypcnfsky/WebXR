@@ -75,6 +75,18 @@
                 Z
             </button>
         </div>
+        <div id="auto-orbit-wrap" class="auto-orbit-wrap">
+            <button
+                type="button"
+                id="btn-auto-orbit"
+                class="axis-fab"
+                aria-label="Auto orbit around origin"
+                aria-pressed="false"
+                title="Slowly orbit the camera around 0,0,0. Tap again to stop."
+            >
+                <span class="auto-orbit-fab-icon" aria-hidden="true"></span>
+            </button>
+        </div>
     </div>
     <div id="menu-backdrop" class="menu-backdrop" hidden aria-hidden="true"></div>
     <div id="app-chrome" class="app-chrome">
@@ -103,6 +115,7 @@
                         <button type="button" id="btn-ar">Enter AR</button>
                         <button type="button" id="btn-pin-phone">Send phone pin</button>
                     </div>
+                    <label class="viewer-show-others"><input type="checkbox" id="viewer-show-others" checked /> Show other devices</label>
                 </div>
             </div>
         </header>
