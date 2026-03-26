@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Sketchar viewer</title>
+    <link rel="stylesheet" href="./viewer.css" />
+</head>
+<body>
+    <canvas id="c"></canvas>
+    <div id="selection-rect-overlay" class="selection-rect-overlay" hidden aria-hidden="true"></div>
+    <div
+        id="multi-select-toolbar"
+        class="multi-select-toolbar"
+        hidden
+        role="toolbar"
+        aria-label="Selection actions"
+    >
+        <button type="button" id="btn-delete-selection" class="toolbar-btn-delete">Delete</button>
+    </div>
+    <div class="viewer-fab-stack">
+        <div id="stylus-draw-wrap" class="stylus-fab-wrap" hidden>
+            <button
+                type="button"
+                id="btn-stylus-draw"
+                class="stylus-fab"
+                aria-label="Draw mode"
+                aria-pressed="false"
+                title="Draw on the view plane: stylus, finger, or mouse (left drag). Toggle on, then drag on the canvas."
+            >
+                <span class="stylus-fab-icon" aria-hidden="true"></span>
+            </button>
+        </div>
+        <div id="select-mode-wrap" class="select-mode-wrap" hidden>
+            <button
+                type="button"
+                id="btn-select-mode"
+                class="stylus-fab select-fab"
+                aria-label="Rectangle select"
+                aria-pressed="false"
+                title="Drag on the canvas to select strokes inside a rectangle. Then delete or clear."
+            >
+                <span class="select-fab-icon" aria-hidden="true"></span>
+            </button>
+        </div>
+        <div id="axis-view-wrap" class="axis-view-wrap" role="group" aria-label="Axis-aligned views">
+            <button
+                type="button"
+                id="btn-axis-view-x"
+                class="axis-fab"
+                aria-label="View along X axis"
+                aria-pressed="false"
+                title="YZ plane — orbit tilts in one meridian; pan and zoom. Tap again to unlock."
+            >
+                X
+            </button>
+            <button
+                type="button"
+                id="btn-axis-view-y"
+                class="axis-fab"
+                aria-label="View along Y axis (plan)"
+                aria-pressed="false"
+                title="XZ plane — orbit spins in plan only; pan and zoom. Tap again to unlock."
+            >
+                Y
+            </button>
+            <button
+                type="button"
+                id="btn-axis-view-z"
+                class="axis-fab"
+                aria-label="View along Z axis"
+                aria-pressed="false"
+                title="XY plane — orbit tilts in one meridian; pan and zoom. Tap again to unlock."
+            >
+                Z
+            </button>
+        </div>
+    </div>
+    <div id="menu-backdrop" class="menu-backdrop" hidden aria-hidden="true"></div>
+    <div id="app-chrome" class="app-chrome">
+        <header class="app-top-bar">
+            <h1 class="app-brand">Sketchar</h1>
+            <div class="settings-menu">
+                <button
+                    type="button"
+                    id="btn-menu-toggle"
+                    class="btn-menu-toggle"
+                    aria-label="Settings menu"
+                    aria-expanded="false"
+                    aria-controls="settings-panel"
+                >
+                    <span class="btn-menu-toggle-icon" aria-hidden="true"></span>
+                </button>
+                <div id="settings-panel" class="settings-panel" role="region" aria-label="Connection settings">
+                    <label>Room <input type="text" id="room" placeholder="4-char code" maxlength="12" autocomplete="off" spellcheck="false" /></label>
+                    <div class="modes">
+                        <span>Mode:</span>
+                        <label><input type="radio" name="mode" value="2d" checked /> 3D (orbit)</label>
+                        <label><input type="radio" name="mode" value="ar" /> AR (in front)</label>
+                        <label><input type="radio" name="mode" value="align" /> AR + room pin</label>
+                    </div>
+                    <div class="row">
+                        <button type="button" id="btn-ar">Enter AR</button>
+                        <button type="button" id="btn-pin-phone">Send phone pin</button>
+                    </div>
+                </div>
+            </div>
+        </header>
+        <p id="status" class="status status-bar">Starting…</p>
+    </div>
+    <script type="module" src="./viewer.js"></script>
+</body>
+</html>
