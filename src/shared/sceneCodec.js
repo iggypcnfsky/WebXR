@@ -11,6 +11,7 @@ import {
   DEFAULT_STROKE_COLOR_HEX,
   getStrokeMaterialForHex,
 } from "./strokeMaterial.js";
+import { loadGltfIntoGroup } from "./gltfSceneLoader.js";
 
 export const STROKE_WIDTH_MIN = 0.02;
 export const STROKE_WIDTH_MAX = 0.5;
@@ -49,6 +50,9 @@ function canonicalForLegacyHash(node) {
   }
   if (node.t === "voxel") {
     return node;
+  }
+  if (node.t === "gltf" && typeof node.url === "string") {
+    return { t: "gltf", url: node.url };
   }
   return node;
 }
@@ -321,6 +325,15 @@ function serializeNode(o) {
     if (o.userData.syncId) out.id = o.userData.syncId;
     return out;
   }
+  if (o.isGroup && o.userData && o.userData.isGltfAsset) {
+    const url =
+      typeof o.userData.gltfUrl === "string" ? o.userData.gltfUrl.trim() : "";
+    if (!url) return null;
+    /** @type {Record<string, unknown>} */
+    const out = { t: "gltf", tr: decompose(o), url };
+    if (o.userData.syncId) out.id = o.userData.syncId;
+    return out;
+  }
   if (o.isGroup && o.userData && o.userData.isStrokeCluster) {
     /** @type {Record<string, unknown>} */
     const out = {
@@ -427,6 +440,9 @@ function applyTr(obj, tr) {
 
 /** Free GPU buffers for a subtree (stroke clusters nest meshes; top-level dispose was not enough). Materials are caller-owned — not disposed. */
 export function disposeSceneGeometrySubtree(root) {
+  if (root && root.userData && root.userData.isGltfAsset) {
+    root.userData.gltfLoadToken = null;
+  }
   const seen = new Set();
   root.traverse((obj) => {
     const g = obj.geometry;
@@ -472,6 +488,110 @@ function payloadsEqualSerialized(ser, node) {
   return stableStringifyNode(a) === stableStringifyNode(b);
 }
 
+/** Deep strip `tr` for geometry-only comparison (recursive for cluster nodes). */
+function stripTrRecursive(obj) {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(stripTrRecursive);
+  const out = {};
+  for (const k of Object.keys(obj).sort()) {
+    if (k === "tr") continue;
+    out[k] = stripTrRecursive(obj[k]);
+  }
+  return out;
+}
+
+/**
+ * True if serialized scene node matches incoming payload on everything except transform.
+ * @param {object} ser from serializeNode(existing)
+ * @param {object} node incoming payload node
+ */
+export function payloadsGeometryEqual(ser, node) {
+  if (!ser || !node) return false;
+  const a = normalizeSnapshotNode(ser);
+  const b = normalizeSnapshotNode(node);
+  return (
+    stableStringifyNode(stripTrRecursive(a)) ===
+    stableStringifyNode(stripTrRecursive(b))
+  );
+}
+
+/**
+ * Same GLB / stroke / cluster asset: update transform only (avoids dispose/reload).
+ * @param {THREE.Object3D} existing
+ * @param {object} node
+ */
+export function canApplyTransformOnlyInPlace(existing, node) {
+  if (!existing || !node) return false;
+  const ser = serializeNode(existing);
+  if (!ser) return false;
+  if (ser.t !== node.t) return false;
+  if (nodeIdFromPayload(ser) !== nodeIdFromPayload(node)) return false;
+  if (node.t === "gltf") return canApplyGltfPayloadInPlace(existing, node);
+  if (node.t === "stroke" || node.t === "cluster") {
+    return payloadsGeometryEqual(ser, node);
+  }
+  return false;
+}
+
+function clearNetworkTransformSmoothState(obj) {
+  if (!obj.userData) return;
+  delete obj.userData.networkTrTarget;
+  delete obj.userData.networkTrSmoothInitialized;
+}
+
+function clearAllNetworkTransformSmoothState(target) {
+  target.traverse((obj) => {
+    clearNetworkTransformSmoothState(obj);
+  });
+}
+
+function setNetworkTargetFromTr(obj, tr) {
+  if (!tr || !tr.p || !tr.q || !tr.s) return;
+  obj.userData.networkTrTarget = {
+    p: [tr.p[0], tr.p[1], tr.p[2]],
+    q: [tr.q[0], tr.q[1], tr.q[2], tr.q[3]],
+    s: [tr.s[0], tr.s[1], tr.s[2]],
+  };
+}
+
+function syncNetworkTargetsToCurrent(obj) {
+  if (!obj.userData.networkTrTarget) obj.userData.networkTrTarget = {};
+  const t = obj.userData.networkTrTarget;
+  t.p = [obj.position.x, obj.position.y, obj.position.z];
+  t.q = [obj.quaternion.x, obj.quaternion.y, obj.quaternion.z, obj.quaternion.w];
+  t.s = [obj.scale.x, obj.scale.y, obj.scale.z];
+}
+
+/**
+ * @param {THREE.Object3D} obj
+ * @param {object} tr
+ * @param {{ smoothNetworkTransforms?: boolean, isLocalAuthority?: (o: THREE.Object3D) => boolean }} [applyOpts]
+ */
+function applyNetworkTransform(obj, tr, applyOpts) {
+  if (!tr) return;
+  const smooth = applyOpts?.smoothNetworkTransforms === true;
+  const isAuthFn = applyOpts?.isLocalAuthority;
+  if (!smooth) {
+    applyTr(obj, tr);
+    clearNetworkTransformSmoothState(obj);
+    return;
+  }
+  const localAuth =
+    typeof isAuthFn === "function" ? !!isAuthFn(obj) : false;
+  setNetworkTargetFromTr(obj, tr);
+  if (localAuth) {
+    applyTr(obj, tr);
+    syncNetworkTargetsToCurrent(obj);
+    obj.userData.networkTrSmoothInitialized = true;
+    return;
+  }
+  if (!obj.userData.networkTrSmoothInitialized) {
+    applyTr(obj, tr);
+    syncNetworkTargetsToCurrent(obj);
+    obj.userData.networkTrSmoothInitialized = true;
+  }
+}
+
 /**
  * Compare two scene payloads ignoring top-level node order (merge uses Map insertion order).
  * Use to skip applyScenePayloadIncremental when merge did not change anything vs local — avoids
@@ -488,20 +608,48 @@ export function scenePayloadsEqual(a, b) {
   return stableStringifyNode({ v: 1, nodes: na }) === stableStringifyNode({ v: 1, nodes: nb });
 }
 
-/**
- * Apply snapshot without tearing down the whole group — avoids multi‑second hitches / flicker on sync.
- * Falls back to full replace when structural edge cases appear (no syncId children).
- * @param {object} data
- * @param {THREE.Material} material
- * @param {THREE.Group} target
- */
 /** Direct children with this flag are kept across apply (e.g. viewer presence, origin gizmo). */
 function shouldPreserveSceneChild(obj) {
   return !!(obj && obj.userData && obj.userData.preserveInSceneApply);
 }
 
-export function applyScenePayloadIncremental(data, material, target) {
+/**
+ * Same GLB asset id + URL: update transform only (avoids dispose/reload during grab/sync).
+ * @param {THREE.Object3D} existing
+ * @param {object} node
+ */
+function canApplyGltfPayloadInPlace(existing, node) {
+  if (!existing || !node || node.t !== "gltf") return false;
+  if (!existing.isGroup || !existing.userData || !existing.userData.isGltfAsset) {
+    return false;
+  }
+  const url = typeof node.url === "string" ? node.url.trim() : "";
+  const cur =
+    typeof existing.userData.gltfUrl === "string"
+      ? existing.userData.gltfUrl.trim()
+      : "";
+  if (!url || url !== cur) return false;
+  const sid =
+    existing.userData.syncId && typeof existing.userData.syncId === "string"
+      ? existing.userData.syncId
+      : "";
+  return sid !== "" && sid === node.id;
+}
+
+/**
+ * Apply snapshot without tearing down the whole group — avoids multi‑second hitches / flicker on sync.
+ * Optional `smoothNetworkTransforms` lerps remote transform updates each frame (see `sceneNetworkTransformSmooth.js`).
+ * @param {object} data
+ * @param {THREE.Material} material
+ * @param {THREE.Group} target
+ * @param {{ smoothNetworkTransforms?: boolean, isLocalAuthority?: (o: THREE.Object3D) => boolean }} [applyOpts]
+ */
+export function applyScenePayloadIncremental(data, material, target, applyOpts) {
   if (!data || data.v !== 1 || !Array.isArray(data.nodes)) return;
+  const smooth = applyOpts?.smoothNetworkTransforms === true;
+  if (!smooth) {
+    clearAllNetworkTransformSmoothState(target);
+  }
   const desired = data.nodes.map((n) => ({ ...n, id: nodeIdFromPayload(n) }));
 
   const existingById = new Map();
@@ -518,6 +666,12 @@ export function applyScenePayloadIncremental(data, material, target) {
     if (existing) {
       const ser = serializeNode(existing);
       if (ser && payloadsEqualSerialized(ser, node)) {
+        next.push(existing);
+        existingById.delete(id);
+        continue;
+      }
+      if (canApplyTransformOnlyInPlace(existing, node)) {
+        applyNetworkTransform(existing, node.tr, applyOpts);
         next.push(existing);
         existingById.delete(id);
         continue;
@@ -577,6 +731,7 @@ export function deserializeSceneV1(data, material, target) {
 
 function buildNode(node, material) {
   if (node.t === "stroke") {
+    if (!Array.isArray(node.points) || node.points.length === 0) return null;
     const pts = node.points.map(
       (a) => new THREE.Vector3(a[0], a[1], a[2]),
     );
@@ -645,6 +800,21 @@ function buildNode(node, material) {
         ? node.id
         : stableIdForLegacyNode(node);
     return inst;
+  }
+  if (node.t === "gltf") {
+    const url = typeof node.url === "string" ? node.url.trim() : "";
+    if (!url) return null;
+    const g = new THREE.Group();
+    g.userData.isGltfAsset = true;
+    g.userData.gltfUrl = url;
+    g.frustumCulled = false;
+    applyTr(g, node.tr);
+    g.userData.syncId =
+      node.id && typeof node.id === "string"
+        ? node.id
+        : stableIdForLegacyNode(node);
+    loadGltfIntoGroup(g, url);
+    return g;
   }
   return null;
 }

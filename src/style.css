@@ -115,6 +115,14 @@ body.xr-presenting .sketchar-menu-backdrop {
     width: min(182px, 100%);
 }
 
+.sketchar-lobby-hint {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    color: rgba(190, 205, 230, 0.72);
+    text-align: center;
+}
+
 .sketchar-room-input {
     width: 100%;
     box-sizing: border-box;
@@ -171,6 +179,17 @@ body.xr-presenting .sketchar-menu-backdrop {
     outline-offset: 2px;
 }
 
+.sketchar-lobby-actions--preview button {
+    border-color: rgba(120, 150, 190, 0.22);
+    background: linear-gradient(180deg, rgba(52, 72, 108, 0.55) 0%, rgba(38, 54, 86, 0.5) 100%);
+    font-weight: 480;
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
+}
+
+.sketchar-lobby-actions--preview button:hover {
+    border-color: rgba(140, 170, 220, 0.32);
+}
+
 .sketchar-recent {
     margin-top: 2px;
     padding-top: 12px;
@@ -201,22 +220,63 @@ body.xr-presenting .sketchar-menu-backdrop {
     padding: 0 2px;
 }
 
-.sketchar-recent-item {
-    width: 100%;
-    padding: 8px 10px;
-    border-radius: 8px;
+.sketchar-recent-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.12);
     background: rgba(0, 0, 0, 0.28);
+}
+
+.sketchar-recent-code {
+    flex: 1;
+    min-width: 0;
     color: #e8eef8;
     font: 600 13px ui-monospace, Menlo, monospace;
     letter-spacing: 0.08em;
-    cursor: pointer;
-    text-align: left;
 }
 
-.sketchar-recent-item:hover {
-    background: rgba(70, 110, 200, 0.35);
-    border-color: rgba(140, 180, 255, 0.35);
+.sketchar-recent-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.sketchar-recent-btn {
+    min-height: 40px;
+    min-width: 40px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(140, 170, 230, 0.28);
+    background: linear-gradient(180deg, rgba(70, 100, 170, 0.4) 0%, rgba(48, 76, 140, 0.38) 100%);
+    color: #eef3ff;
+    font: 600 11px/1 system-ui, sans-serif;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    touch-action: manipulation;
+}
+
+.sketchar-recent-btn--preview {
+    border-color: rgba(120, 150, 190, 0.25);
+    background: linear-gradient(180deg, rgba(48, 68, 100, 0.55) 0%, rgba(36, 52, 80, 0.5) 100%);
+    font-weight: 580;
+}
+
+.sketchar-recent-btn:hover {
+    border-color: rgba(140, 180, 255, 0.4);
+    background: rgba(70, 110, 200, 0.42);
+}
+
+.sketchar-recent-btn--preview:hover {
+    border-color: rgba(130, 160, 210, 0.35);
+    background: rgba(56, 80, 120, 0.55);
+}
+
+.sketchar-recent-btn:focus-visible {
+    outline: 2px solid rgba(140, 180, 255, 0.55);
+    outline-offset: 2px;
 }
 
 #XRButton {
@@ -262,11 +322,11 @@ body.xr-presenting .sketchar-menu-backdrop {
     top: 0 !important;
     right: auto !important;
     bottom: auto !important;
-    width: 190px !important;
+    width: 288px !important;
     min-height: 0 !important;
     height: fit-content !important;
-    max-height: 92vh;
-    overflow-y: auto;
+    max-height: none;
+    overflow-y: visible;
     overflow-x: hidden;
     transform: none !important;
     transition: none !important;
@@ -280,9 +340,14 @@ body.xr-presenting .sketchar-menu-backdrop {
 }
 
 .sketchar-advanced--xr-source .sketchar-advanced-inner {
-    padding: 14px 12px 16px;
+    padding: 14px 16px 20px;
     font-size: 14px;
     line-height: 1.4;
+}
+
+/* Wrist HTMLMesh: hide viewer URL string (copy button still works); keeps panel shorter */
+.sketchar-advanced--xr-source #sketchar-viewer-link {
+    display: none !important;
 }
 
 .sketchar-advanced--xr-source .sketchar-broadcast,
@@ -301,11 +366,108 @@ body.xr-presenting .sketchar-menu-backdrop {
     display: flex;
     flex-direction: row;
     align-items: center;
-    padding: 6px 8px;
-    margin-bottom: 6px;
+    min-height: 44px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
     border-radius: 14px;
     background: rgba(0, 0, 0, 0.22);
     border: 1px solid rgba(255, 255, 255, 0.06);
+    box-sizing: border-box;
+}
+
+.sketchar-advanced--xr-source .sketchar-broadcast input[type="checkbox"] {
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    min-height: 22px;
+    flex-shrink: 0;
+    margin: 0;
+    cursor: pointer;
+}
+
+.sketchar-row--export-glb {
+    display: block;
+    margin: 8px 0 10px;
+}
+
+.sketchar-wrist-export-cta {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 48px;
+    padding: 10px 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(120, 190, 255, 0.45);
+    background: linear-gradient(165deg, rgba(55, 95, 180, 0.55), rgba(25, 45, 95, 0.92));
+    color: #f0f6ff;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.12) inset,
+        0 4px 14px rgba(0, 0, 0, 0.4);
+}
+
+.sketchar-wrist-export-cta:hover:not(:disabled) {
+    border-color: rgba(160, 210, 255, 0.55);
+}
+
+.sketchar-wrist-export-cta:active:not(:disabled) {
+    transform: scale(0.98);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+.sketchar-wrist-export-cta:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.sketchar-wrist-export-cta[data-state="uploading"] {
+    pointer-events: none;
+    opacity: 0.75;
+}
+
+.sketchar-wrist-export-cta__icon {
+    display: inline-flex;
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+}
+
+.sketchar-wrist-export-cta__icon svg {
+    display: block;
+    width: 22px;
+    height: 22px;
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-export-cta {
+    font-size: 14px;
+    min-height: 58px;
+    padding: 12px 16px;
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-export-cta__icon {
+    width: 26px;
+    height: 26px;
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-export-cta__icon svg {
+    width: 26px;
+    height: 26px;
+}
+
+.sketchar-advanced--xr-source .sketchar-advanced-inner > .sketchar-broadcast:first-of-type {
+    margin-top: 12px;
+}
+
+.sketchar-advanced--xr-source .sketchar-row--export-glb {
+    margin-top: 6px;
 }
 
 .sketchar-advanced--xr-source .sketchar-row--wrist-actions {
@@ -314,15 +476,19 @@ body.xr-presenting .sketchar-menu-backdrop {
     justify-content: center;
     align-items: center;
     gap: 14px;
-    margin: 10px 0 8px;
+    margin: 14px 0 10px;
 }
 
 .sketchar-advanced--xr-source .sketchar-row--wrist-undo {
-    margin-top: 2px;
-    margin-bottom: 6px;
+    margin-top: 4px;
+    margin-bottom: 8px;
 }
 
 .sketchar-advanced--xr-source .sketchar-wrist-btn--round {
+    width: 60px;
+    height: 60px;
+    min-width: 60px;
+    min-height: 60px;
     transform: translateY(-1px);
     border: 1px solid rgba(140, 185, 255, 0.42);
     background: radial-gradient(circle at 32% 22%, rgba(110, 155, 235, 0.55), rgba(35, 52, 100, 0.82));
@@ -367,11 +533,25 @@ body.xr-presenting .sketchar-menu-backdrop {
 
 .sketchar-advanced--xr-source .sketchar-wrist-btn--round svg {
     display: block;
+    width: 28px;
+    height: 28px;
 }
 
 .sketchar-advanced--xr-source .sketchar-row:not(.sketchar-row--wrist-actions) {
     flex-direction: column;
     align-items: stretch;
+}
+
+/* Wrist HTMLMesh: debug hit zones (same DOM bounds as htmlevent); baked into HTMLMesh texture */
+body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source button,
+body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source input[type="range"] {
+    outline: 2px dashed rgba(0, 255, 200, 0.95);
+    outline-offset: 2px;
+}
+
+body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .sketchar-broadcast input[type="checkbox"] {
+    outline: 2px dashed rgba(255, 200, 80, 0.95);
+    outline-offset: 2px;
 }
 
 .sketchar-grid__ico {
@@ -384,20 +564,100 @@ body.xr-presenting .sketchar-menu-backdrop {
 .sketchar-advanced--xr-source .grid-controls {
     flex-direction: column;
     align-items: stretch;
-    gap: 6px;
-    margin-top: 4px;
-    padding: 10px 8px;
+    gap: 10px;
+    margin-top: 6px;
+    padding: 12px 10px;
+}
+
+.sketchar-advanced--xr-source .grid-controls--wrist-top {
+    margin-top: 0;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke {
+    padding-top: 10px;
+    padding-bottom: 14px;
 }
 
 .sketchar-advanced--xr-source .grid-controls label {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: 6px;
 }
 
+/* Horizontal range only (HTMLMesh htmlevent uses offsetX/width); thick track + thumb for XR hit targets */
 .sketchar-advanced--xr-source .grid-controls input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
     width: 100%;
+    height: 44px;
+    margin: 4px 0 2px;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
+    box-sizing: border-box;
+}
+
+.sketchar-advanced--xr-source .grid-controls input[type="range"]::-webkit-slider-runnable-track {
+    height: 14px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.sketchar-advanced--xr-source .grid-controls input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 28px;
+    height: 28px;
+    margin-top: -8px;
+    border-radius: 50%;
+    background: linear-gradient(165deg, rgba(130, 175, 255, 0.95), rgba(70, 110, 210, 0.98));
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+.sketchar-advanced--xr-source .grid-controls input[type="range"]::-moz-range-track {
+    height: 14px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.sketchar-advanced--xr-source .grid-controls input[type="range"]::-moz-range-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(165deg, rgba(130, 175, 255, 0.95), rgba(70, 110, 210, 0.98));
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* Stroke max: very large vertical hit area + thick track (granular step 0.001 in HTML) */
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"] {
+    height: 112px;
+    margin: 8px 0 6px;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-webkit-slider-runnable-track {
+    height: 56px;
+    border-radius: 12px;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-webkit-slider-thumb {
+    width: 44px;
+    height: 44px;
+    margin-top: 6px;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-moz-range-track {
+    height: 56px;
+    border-radius: 12px;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-moz-range-thumb {
+    width: 44px;
+    height: 44px;
 }
 
 .sketchar-row {

@@ -4,6 +4,7 @@ import Menu from "lucide/dist/esm/icons/menu.js";
 import Pen from "lucide/dist/esm/icons/pen.js";
 import Rotate3d from "lucide/dist/esm/icons/rotate-3d.js";
 import Scan from "lucide/dist/esm/icons/scan.js";
+import Upload from "lucide/dist/esm/icons/upload.js";
 import { TubePainter } from "three/examples/jsm/misc/TubePainter.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
@@ -23,6 +24,7 @@ import { normalizeRoomCode } from "./shared/roomCode.js";
 import {
   defaultPresenceLabel,
   disposePresencePeerSubtree,
+  ensurePresenceNetworkGroup,
   getOrCreateDeviceId,
   getShowOthersPreference,
   preloadPresenceHeadModel,
@@ -35,6 +37,7 @@ import {
   SKETCHAR_PRESENCE_STYLUS_GLB_URL,
   smoothPresencePeers,
 } from "./shared/sketcharPresence.js";
+import { smoothSceneNetworkTransforms } from "./shared/sceneNetworkTransformSmooth.js";
 import {
   fetchRoomBySlug,
   getSketcharSupabase,
@@ -48,6 +51,7 @@ import {
   getStrokeMaterialForHex,
   voxelMaterial,
 } from "./shared/strokeMaterial.js";
+import { deleteRoomGlbFromR2, uploadGlbArrayBuffer } from "./shared/glbExport.js";
 
 /**
  * Lucide ESM icon → SVG element (viewBox 24×24).
@@ -83,6 +87,9 @@ function newStrokeSyncId() {
 }
 
 const canvas = document.getElementById("c");
+const elGlbDropHint = document.getElementById("viewer-glb-drop-hint");
+const elGlbDropIcon = document.querySelector(".viewer-glb-drop-icon");
+if (elGlbDropIcon) elGlbDropIcon.appendChild(lucideIconToSvg(Upload));
 const elRoom = document.getElementById("room");
 const elStatus = document.getElementById("status");
 const btnAr = document.getElementById("btn-ar");
@@ -155,6 +162,7 @@ function persistFollowSliderValues() {
   }
 }
 
+/** Applies FOV to the **preview** PerspectiveCamera only. WebXR on Quest ignores `camera.fov` during immersive session. */
 function applyFollowFovToCamera() {
   const n = elQuestFollowFov ? Number(elQuestFollowFov.value) : DEFAULT_FOLLOW_FOV;
   const fov = Number.isFinite(n) ? THREE.MathUtils.clamp(n, FOLLOW_FOV_MIN, FOLLOW_FOV_MAX) : DEFAULT_FOLLOW_FOV;
@@ -360,6 +368,7 @@ void preloadPresenceStylusModel(SKETCHAR_PRESENCE_STYLUS_GLB_URL)
   })
   .catch(() => {});
 let viewerLastPresenceSmoothMs = performance.now();
+let viewerLastSceneNetworkSmoothMs = performance.now();
 const viewerDeviceId = getOrCreateDeviceId();
 let viewerShowOthers = getShowOthersPreference();
 /** Match preview camera to a Quest head pose from presence (3D follow, not video). */
@@ -367,6 +376,9 @@ let followQuestActive = false;
 /** @type {string | null} */
 let followQuestDeviceId = null;
 let lastQuestFollowSelectKey = "";
+/** Throttle status when follow camera waits for a valid head pose (preview-only; Quest headset FOV is runtime-controlled). */
+let lastFollowPoseWarnMs = 0;
+let lastFollowPoseOk = true;
 /** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
 let viewerRoomRealtime = null;
 let lastViewerPresenceSendMs = 0;
@@ -456,16 +468,75 @@ const transformControl = new TransformControls(camera, canvas);
 transformControl.setMode("translate");
 transformControl.setSpace("world");
 transformControl.setSize(0.85);
+/* Touch pointermove often reports button 0; TransformControls.pointerMove requires button -1. */
+const _origTransformGetPointer = transformControl._getPointer.bind(transformControl);
+transformControl._getPointer = (event) => {
+  const p = _origTransformGetPointer(event);
+  if (event.pointerType === "touch" && event.type === "pointermove") {
+    return { x: p.x, y: p.y, button: -1 };
+  }
+  return p;
+};
 transformControl.addEventListener("dragging-changed", (event) => {
   /* While dragging the gizmo, disable OrbitControls entirely so touch/mouse goes to TransformControls. */
   controls.enabled = !event.value && !followQuestActive;
+  if (
+    !event.value &&
+    viewerRoomId &&
+    !stylusDrawActive &&
+    transformControl.object != null
+  ) {
+    queueViewerSnapshotPost();
+  }
+  if (!event.value && transformControl.object != null) {
+    applySelectionOrbitTarget(transformControl.object);
+  }
 });
 scene.add(transformControl);
 
+/** Wireframe bounds for the current gizmo selection (world-space; not parented to pivot). */
+const selectionBoundsHelper = new THREE.BoxHelper(new THREE.Group(), 0xffcc33);
+selectionBoundsHelper.visible = false;
+scene.add(selectionBoundsHelper);
+
+function updateSelectionBoundsHelper() {
+  const obj = transformControl.object;
+  if (obj == null) {
+    selectionBoundsHelper.visible = false;
+    selectionBoundsHelper.object = undefined;
+    return;
+  }
+  selectionBoundsHelper.setFromObject(obj);
+}
+
+let viewerTransformSyncLastMs = 0;
+const VIEWER_TRANSFORM_SYNC_MS = 120;
+
+function viewerTransformSyncAllowedWhileDragging() {
+  const o = transformControl.object;
+  if (o == null) return false;
+  /* Pivot wrappers are not serialized; mid-drag sync only when gizmo is on the real root (e.g. GLB). */
+  if (o.userData && o.userData.skViewerPivot) return false;
+  return true;
+}
+
 transformControl.addEventListener("objectChange", () => {
   if (transformControl.object != null) {
-    applySelectionOrbitTarget(transformControl.object);
+    updateSelectionBoundsHelper();
   }
+  if (
+    !transformControl.dragging ||
+    !viewerRoomId ||
+    stylusDrawActive ||
+    viewerStrokePosting ||
+    !viewerTransformSyncAllowedWhileDragging()
+  ) {
+    return;
+  }
+  const t = performance.now();
+  if (t - viewerTransformSyncLastMs < VIEWER_TRANSFORM_SYNC_MS) return;
+  viewerTransformSyncLastMs = t;
+  queueViewerSnapshotPost();
 });
 
 function isCoarsePointer() {
@@ -553,6 +624,13 @@ window.addEventListener("keydown", (e) => {
   }
   if (isTypingTarget(e.target)) return;
   if (renderer.xr.isPresenting) return;
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (viewerHasDeletableSelection()) {
+      e.preventDefault();
+      void deleteViewerSelectionAndSync();
+    }
+    return;
+  }
   if (transformControl.object) {
     if (e.key === "t" || e.key === "T") {
       transformControl.setMode("translate");
@@ -661,11 +739,22 @@ function attachTransformToSelection(root) {
   detachTransformKeepOrbitTarget();
   if (!root || !root.parent) return;
 
+  /* GLB room assets must stay direct children of contentGroup so serializeStrokesGroup includes tr. */
+  if (root.userData && root.userData.isGltfAsset) {
+    transformControl.attach(root);
+    syncOrbitWithGizmo();
+    applySelectionOrbitTarget(transformControl.object);
+    if (axisViewActive) applyAxisView(axisViewActive);
+    updateSelectionBoundsHelper();
+    return;
+  }
+
   if (root.userData.skViewerPivot) {
     transformControl.attach(root);
     syncOrbitWithGizmo();
     applySelectionOrbitTarget(transformControl.object);
     if (axisViewActive) applyAxisView(axisViewActive);
+    updateSelectionBoundsHelper();
     return;
   }
   if (root.parent?.userData?.skViewerPivot) {
@@ -673,6 +762,7 @@ function attachTransformToSelection(root) {
     syncOrbitWithGizmo();
     applySelectionOrbitTarget(transformControl.object);
     if (axisViewActive) applyAxisView(axisViewActive);
+    updateSelectionBoundsHelper();
     return;
   }
 
@@ -682,6 +772,7 @@ function attachTransformToSelection(root) {
     syncOrbitWithGizmo();
     applySelectionOrbitTarget(transformControl.object);
     if (axisViewActive) applyAxisView(axisViewActive);
+    updateSelectionBoundsHelper();
     return;
   }
 
@@ -699,6 +790,7 @@ function attachTransformToSelection(root) {
   syncOrbitWithGizmo();
   if (transformControl.object) applySelectionOrbitTarget(transformControl.object);
   if (axisViewActive) applyAxisView(axisViewActive);
+  updateSelectionBoundsHelper();
 }
 
 function detachTransformClean() {
@@ -716,6 +808,8 @@ function detachTransformClean() {
   }
   setControlsTargetToSketchWorldOrigin();
   transformControl.visible = false;
+  selectionBoundsHelper.visible = false;
+  selectionBoundsHelper.object = undefined;
   syncOrbitWithGizmo();
 }
 
@@ -734,6 +828,8 @@ function detachTransformKeepOrbitTarget() {
     }
   }
   transformControl.visible = false;
+  selectionBoundsHelper.visible = false;
+  selectionBoundsHelper.object = undefined;
   syncOrbitWithGizmo();
 }
 
@@ -1077,6 +1173,54 @@ function getMovableRoot(hit) {
   return o.parent === contentGroup ? o : null;
 }
 
+function isViewerDeletableContentRoot(root) {
+  if (!root || root.parent !== contentGroup) return false;
+  if (root.userData && root.userData.preserveInSceneApply) return false;
+  if (root === remotePresenceGroup || root === viewerOriginGizmoGroup) return false;
+  return true;
+}
+
+/** TransformControls may attach to a skViewerPivot; walk up to the direct child of contentGroup. */
+function getContentGroupRootFromTransformAttached(obj) {
+  if (!obj) return null;
+  let o = obj;
+  while (o.parent && o.parent !== contentGroup) {
+    o = o.parent;
+  }
+  return o.parent === contentGroup ? o : null;
+}
+
+/** Scene sync smoothing: while dragging the gizmo, follow network transforms immediately for that root. */
+function viewerSceneNetworkIsLocalAuthority(obj) {
+  if (!transformControl.dragging) return false;
+  const root = getContentGroupRootFromTransformAttached(transformControl.object);
+  return root != null && root === obj;
+}
+
+/** Stable snapshot id for tombstoning (pivot wrappers do not serialize as nodes). */
+function viewerSceneNodeIdForContentRoot(root) {
+  if (!root || root.parent !== contentGroup) return null;
+  if (root.userData && root.userData.skViewerPivot) {
+    for (const ch of root.children) {
+      const id = sceneNodeIdFromObject3D(ch);
+      if (id) return id;
+    }
+    return null;
+  }
+  return sceneNodeIdFromObject3D(root);
+}
+
+function viewerHasDeletableSelection() {
+  if (multiSelectedRoots.size > 0) {
+    for (const r of multiSelectedRoots) {
+      if (isViewerDeletableContentRoot(r)) return true;
+    }
+    return false;
+  }
+  const root = getContentGroupRootFromTransformAttached(transformControl.object);
+  return !!(root && isViewerDeletableContentRoot(root));
+}
+
 function normalizeClientRect(x0, y0, x1, y1) {
   return {
     left: Math.min(x0, x1),
@@ -1149,28 +1293,44 @@ function updateSelectionRectOverlay() {
 
 function clearMultiSelection() {
   multiSelectedRoots.clear();
-  if (elMultiSelectToolbar) elMultiSelectToolbar.hidden = true;
 }
 
 function pruneMultiSelection() {
   for (const r of [...multiSelectedRoots]) {
     if (!r.parent || r.parent !== contentGroup) multiSelectedRoots.delete(r);
   }
-  if (multiSelectedRoots.size === 0 && elMultiSelectToolbar) {
-    elMultiSelectToolbar.hidden = true;
-  }
 }
 
-function updateMultiSelectToolbarPosition() {
-  if (!elMultiSelectToolbar || multiSelectedRoots.size === 0) return;
+function updateSelectionActionToolbarVisibility() {
+  if (!elMultiSelectToolbar) return;
+  const mode2d = getViewMode() === "2d" || getViewMode() === "align";
+  const hasMulti = multiSelectedRoots.size > 0;
+  const hasGizmo =
+    transformControl.object != null &&
+    !stylusDrawActive &&
+    mode2d &&
+    !renderer.xr.isPresenting;
+  elMultiSelectToolbar.hidden = !hasMulti && !hasGizmo;
+}
+
+function updateSelectionActionToolbarPosition() {
+  if (!elMultiSelectToolbar || elMultiSelectToolbar.hidden) return;
   let first = true;
-  for (const r of multiSelectedRoots) {
-    _bbWorld.setFromObject(r);
-    if (_bbWorld.isEmpty()) continue;
-    if (first) {
+  if (multiSelectedRoots.size > 0) {
+    for (const r of multiSelectedRoots) {
+      _bbWorld.setFromObject(r);
+      if (_bbWorld.isEmpty()) continue;
+      if (first) {
+        _bbUnion.copy(_bbWorld);
+        first = false;
+      } else _bbUnion.union(_bbWorld);
+    }
+  } else if (transformControl.object) {
+    _bbWorld.setFromObject(transformControl.object);
+    if (!_bbWorld.isEmpty()) {
       _bbUnion.copy(_bbWorld);
       first = false;
-    } else _bbUnion.union(_bbWorld);
+    }
   }
   if (first) return;
   _bbUnion.getCenter(_bbProj);
@@ -1185,10 +1345,8 @@ function updateMultiSelectToolbarPosition() {
 function setMultiSelection(roots) {
   multiSelectedRoots.clear();
   for (const r of roots) multiSelectedRoots.add(r);
-  if (elMultiSelectToolbar) {
-    elMultiSelectToolbar.hidden = multiSelectedRoots.size === 0;
-  }
-  updateMultiSelectToolbarPosition();
+  updateSelectionActionToolbarVisibility();
+  updateSelectionActionToolbarPosition();
 }
 
 function clearViewerRemotePeers() {
@@ -1211,29 +1369,31 @@ function handleViewerRemotePresence(p) {
   if (!g) {
     g = new THREE.Group();
     g.name = `peer-${p.deviceId}`;
+    g.userData.isPresencePeerRoot = true;
     remotePresenceGroup.add(g);
     viewerRemotePeers.set(p.deviceId, g);
   }
   g.userData.lastMs = performance.now();
   g.userData.presenceLabel = p.label;
   setPresenceTargetsFromPayload(p, g);
+  const net = ensurePresenceNetworkGroup(g);
   if (
     p.mode === "xr_head" &&
-    g.userData.targetPos &&
+    net.userData.targetPos &&
     QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M !== 0
   ) {
     contentGroup.updateMatrixWorld(true);
-    _questHeadPosWorldAdj.copy(g.userData.targetPos);
+    _questHeadPosWorldAdj.copy(net.userData.targetPos);
     contentGroup.localToWorld(_questHeadPosWorldAdj);
     _questHeadPosWorldAdj.y += QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M;
     contentGroup.worldToLocal(_questHeadPosWorldAdj);
-    g.userData.targetPos.copy(_questHeadPosWorldAdj);
-    if (g.userData.targetStylusPos) {
-      _questHeadPosWorldAdj.copy(g.userData.targetStylusPos);
+    net.userData.targetPos.copy(_questHeadPosWorldAdj);
+    if (net.userData.targetStylusPos) {
+      _questHeadPosWorldAdj.copy(net.userData.targetStylusPos);
       contentGroup.localToWorld(_questHeadPosWorldAdj);
       _questHeadPosWorldAdj.y += QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M;
       contentGroup.worldToLocal(_questHeadPosWorldAdj);
-      g.userData.targetStylusPos.copy(_questHeadPosWorldAdj);
+      net.userData.targetStylusPos.copy(_questHeadPosWorldAdj);
     }
   }
 }
@@ -1302,6 +1462,7 @@ function syncQuestFollowSelectOptions() {
 
 function applyFollowQuestCamera() {
   if (!followQuestActive) return;
+  applyFollowFovToCamera();
   if (!viewerRoomId) {
     setFollowQuestActive(false);
     return;
@@ -1318,10 +1479,46 @@ function applyFollowQuestCamera() {
     setStatus("Quest left the room — follow off.", "");
     return;
   }
+  /* Head pose lives on inner `presence-network`, not the outer peer root (root stays at identity). */
+  const net = ensurePresenceNetworkGroup(peer);
   contentGroup.updateMatrixWorld(true);
   peer.updateMatrixWorld(true);
-  peer.getWorldPosition(_vCamPosW);
-  peer.getWorldQuaternion(_vCamQuatW);
+  net.getWorldPosition(_vCamPosW);
+  net.getWorldQuaternion(_vCamQuatW);
+  if (
+    !Number.isFinite(_vCamPosW.x) ||
+    !Number.isFinite(_vCamPosW.y) ||
+    !Number.isFinite(_vCamPosW.z)
+  ) {
+    const now = performance.now();
+    if (now - lastFollowPoseWarnMs > 2500) {
+      lastFollowPoseWarnMs = now;
+      setStatus("Follow: waiting for valid Quest head position…", "ok");
+    }
+    lastFollowPoseOk = false;
+    return;
+  }
+  const qh = _vCamQuatW;
+  if (
+    !Number.isFinite(qh.x) ||
+    !Number.isFinite(qh.y) ||
+    !Number.isFinite(qh.z) ||
+    !Number.isFinite(qh.w) ||
+    qh.lengthSq() < 1e-10
+  ) {
+    const now = performance.now();
+    if (now - lastFollowPoseWarnMs > 2500) {
+      lastFollowPoseWarnMs = now;
+      setStatus("Follow: waiting for valid Quest head orientation…", "ok");
+    }
+    lastFollowPoseOk = false;
+    return;
+  }
+  qh.normalize();
+  if (!lastFollowPoseOk) {
+    setStatus("Following Quest view.", "ok");
+  }
+  lastFollowPoseOk = true;
   /* World Y offset is applied to xr_head targetPos in handleViewerRemotePresence (world-space). */
   const back = DEFAULT_FOLLOW_BACK_M;
   const down = DEFAULT_FOLLOW_DOWN_M;
@@ -1452,7 +1649,10 @@ function applyRemoteRoomData(data) {
           viewerDeletedSyncIds.delete(id);
         }
       }
-      applyScenePayloadIncremental(merged, voxelMaterial, contentGroup);
+      applyScenePayloadIncremental(merged, voxelMaterial, contentGroup, {
+        smoothNetworkTransforms: true,
+        isLocalAuthority: viewerSceneNetworkIsLocalAuthority,
+      });
       if (snapAt != null) lastViewerSnapshotAppliedAt = snapAt;
       if (!viewerDidInitialFraming) {
         frameContentAtOrigin();
@@ -1772,20 +1972,57 @@ if (btnSelectMode) {
   });
 }
 
+async function deleteViewerSelectionAndSync() {
+  const roots = [];
+  if (multiSelectedRoots.size > 0) {
+    for (const r of multiSelectedRoots) {
+      if (isViewerDeletableContentRoot(r)) roots.push(r);
+    }
+  } else {
+    const root = getContentGroupRootFromTransformAttached(transformControl.object);
+    if (root && isViewerDeletableContentRoot(root)) roots.push(root);
+  }
+  if (roots.length === 0) return;
+
+  const removed = new Set();
+  for (const root of roots) {
+    const id = viewerSceneNodeIdForContentRoot(root);
+    if (id) removed.add(id);
+  }
+
+  for (const root of roots) {
+    if (root.userData && root.userData.isGltfAsset) {
+      const u =
+        typeof root.userData.gltfUrl === "string" ? root.userData.gltfUrl.trim() : "";
+      if (u) {
+        void deleteRoomGlbFromR2(u, {
+          url: getViewerExportUploadUrl(),
+          token: getViewerExportToken(),
+        });
+      }
+    }
+  }
+
+  transformControl.detach();
+  transformControl.visible = false;
+  selectionBoundsHelper.visible = false;
+  selectionBoundsHelper.object = undefined;
+  syncOrbitWithGizmo();
+
+  for (const root of roots) {
+    disposeSceneGeometrySubtree(root);
+    contentGroup.remove(root);
+  }
+  clearMultiSelection();
+  await postViewerSnapshot(removed);
+}
+
 if (btnDeleteSelection) {
   btnDeleteSelection.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    if (multiSelectedRoots.size === 0) return;
-    const removed = new Set();
-    for (const root of multiSelectedRoots) {
-      const id = sceneNodeIdFromObject3D(root);
-      if (id) removed.add(id);
-      disposeSceneGeometrySubtree(root);
-      contentGroup.remove(root);
-    }
-    clearMultiSelection();
-    await postViewerSnapshot(removed);
+    if (!viewerHasDeletableSelection()) return;
+    await deleteViewerSelectionAndSync();
   });
 }
 
@@ -1793,7 +2030,8 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  updateMultiSelectToolbarPosition();
+  updateSelectionActionToolbarVisibility();
+  updateSelectionActionToolbarPosition();
 }
 window.addEventListener("resize", onResize);
 
@@ -1957,6 +2195,11 @@ async function postViewerSnapshot(removedIds) {
       ? removedIds
       : new Set(Array.isArray(removedIds) ? removedIds : []);
   for (const id of removedSet) viewerDeletedSyncIds.add(id);
+  /* Bake skViewerPivot so stroke roots serialize with correct tr (pivot groups are not encoded).
+   * Do not detach while dragging — would break active gizmo moves (GLB attaches without pivot). */
+  if (!transformControl.dragging) {
+    detachTransformKeepOrbitTarget();
+  }
   contentGroup.updateMatrixWorld(true);
   const localPayload = serializeStrokesGroup(contentGroup);
   if (!localPayload.nodes.length && removedSet.size === 0) return;
@@ -2003,6 +2246,129 @@ function queueViewerSnapshotPost() {
       console.warn(err);
     });
 }
+
+function getViewerExportUploadUrl() {
+  const raw = import.meta.env.VITE_EXPORT_GLB_URL;
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function getViewerExportToken() {
+  const raw = import.meta.env.VITE_EXPORT_GLB_TOKEN;
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function dataTransferHasFiles(dt) {
+  if (!dt || !dt.types) return false;
+  return Array.from(dt.types).includes("Files");
+}
+
+function showViewerGlbDropHint() {
+  if (!elGlbDropHint) return;
+  elGlbDropHint.hidden = false;
+  elGlbDropHint.setAttribute("aria-hidden", "false");
+  elGlbDropHint.classList.add("visible");
+}
+
+function hideViewerGlbDropHint() {
+  if (!elGlbDropHint) return;
+  elGlbDropHint.classList.remove("visible");
+  elGlbDropHint.hidden = true;
+  elGlbDropHint.setAttribute("aria-hidden", "true");
+}
+
+canvas.addEventListener("dragover", (e) => {
+  if (!dataTransferHasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  try {
+    e.dataTransfer.dropEffect = "copy";
+  } catch (_) {
+    /* ignore */
+  }
+  showViewerGlbDropHint();
+});
+
+canvas.addEventListener("dragleave", (e) => {
+  if (!dataTransferHasFiles(e.dataTransfer)) return;
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX;
+  const y = e.clientY;
+  if (x < r.left || x > r.right || y < r.top || y > r.bottom) {
+    hideViewerGlbDropHint();
+  }
+});
+
+document.addEventListener("dragend", hideViewerGlbDropHint);
+
+canvas.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  hideViewerGlbDropHint();
+  if (!viewerRoomId) {
+    setStatus("Join a room first.", "err");
+    return;
+  }
+  const room = normalizeRoomCode(elRoom.value || "");
+  if (room.length !== 4) {
+    setStatus("Enter a 4-letter room code.", "err");
+    return;
+  }
+  const f = e.dataTransfer?.files?.[0];
+  if (!f || !String(f.name).toLowerCase().endsWith(".glb")) {
+    setStatus("Drop a .glb file.", "err");
+    return;
+  }
+  const uploadUrl = getViewerExportUploadUrl();
+  const token = getViewerExportToken();
+  if (!uploadUrl || !token) {
+    setStatus("Upload not configured — set VITE_EXPORT_GLB_URL and VITE_EXPORT_GLB_TOKEN.", "err");
+    return;
+  }
+  if (stylusDrawActive || viewerStrokePosting) {
+    setStatus("Wait for sync to finish, then try again.", "err");
+    return;
+  }
+  try {
+    setStatus("Uploading model…", "");
+    const buf = await f.arrayBuffer();
+    const json = await uploadGlbArrayBuffer(buf, {
+      url: uploadUrl,
+      token,
+      roomSlug: room,
+    });
+    const readUrl = json && typeof json.url === "string" ? json.url.trim() : "";
+    if (!readUrl) {
+      setStatus(
+        "Upload succeeded but no public URL — set PUBLIC_R2_READ_URL on the upload server.",
+        "err",
+      );
+      return;
+    }
+    const syncId = newStrokeSyncId();
+    viewerPendingSyncIds.add(syncId);
+    detachTransformKeepOrbitTarget();
+    contentGroup.updateMatrixWorld(true);
+    const localPayload = serializeStrokesGroup(contentGroup);
+    const newNode = {
+      t: "gltf",
+      id: syncId,
+      tr: {
+        p: [0, 0, 0],
+        q: [0, 0, 0, 1],
+        s: [1, 1, 1],
+      },
+      url: readUrl,
+    };
+    applyScenePayloadIncremental(
+      { v: 1, nodes: [...localPayload.nodes, newNode] },
+      voxelMaterial,
+      contentGroup,
+    );
+    queueViewerSnapshotPost();
+    setStatus("Model added to room.", "ok");
+  } catch (err) {
+    console.warn(err);
+    setStatus("Upload failed — check token, R2 env, and network.", "err");
+  }
+});
 
 function finishStylusStroke() {
   const pts = stylusPoints.map((p) => p.clone());
@@ -2271,9 +2637,12 @@ renderer.setAnimationLoop(() => {
     transformControl.object != null &&
     !stylusDrawActive &&
     multiSelectedRoots.size === 0;
+  selectionBoundsHelper.visible =
+    transformControl.visible && transformControl.object != null;
   pruneMultiSelection();
+  updateSelectionActionToolbarVisibility();
   if (elMultiSelectToolbar && !elMultiSelectToolbar.hidden) {
-    updateMultiSelectToolbarPosition();
+    updateSelectionActionToolbarPosition();
   }
 
   if (viewerRemotePeers.size > 0) {
@@ -2286,6 +2655,16 @@ renderer.setAnimationLoop(() => {
     applyViewerPresenceRenderHints();
     remotePresenceGroup.visible = viewerShowOthers;
     pruneStalePresencePeers(viewerRemotePeers, now, 6000);
+  }
+
+  {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - viewerLastSceneNetworkSmoothMs) / 1000);
+    viewerLastSceneNetworkSmoothMs = now;
+    smoothSceneNetworkTransforms(contentGroup, dt, {
+      lambda: 14,
+      isLocalAuthority: viewerSceneNetworkIsLocalAuthority,
+    });
   }
   syncQuestFollowSelectOptions();
   if (

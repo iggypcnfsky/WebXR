@@ -152,6 +152,18 @@ function num(v) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+/** Left/right hand: 5 finger tips × xyz in stroke space. */
+function parseFingerTipArray15(raw) {
+  if (!Array.isArray(raw) || raw.length < 15) return null;
+  const out = /** @type {number[]} */ ([]);
+  for (let i = 0; i < 15; i++) {
+    const v = num(raw[i]);
+    if (!Number.isFinite(v)) return null;
+    out.push(v);
+  }
+  return out;
+}
+
 /**
  * Supabase Realtime may deliver broadcast as `msg.payload`, nested `payload.payload`,
  * `msg.data`, or the body itself (see Realtime server / client version).
@@ -217,7 +229,13 @@ function dispatchPresenceFromBroadcastMsg(
   if (!pr && msg && typeof msg === "object" && "payload" in msg) {
     pr = parsePresenceBroadcastMessage(/** @type {Record<string, unknown>} */ (msg).payload);
   }
-  if (pr) onPresence(pr);
+  if (pr) {
+    try {
+      onPresence(pr);
+    } catch (e) {
+      console.warn("[sketchar] presence handler failed", e);
+    }
+  }
 }
 
 function parsePresenceBroadcastMessage(msg) {
@@ -284,6 +302,10 @@ function parsePresenceBroadcastMessage(msg) {
         out.sqw = sqw;
       }
     }
+    const lf = parseFingerTipArray15(p.lf);
+    if (lf) out.lf = lf;
+    const rf = parseFingerTipArray15(p.rf);
+    if (rf) out.rf = rf;
   }
   return out;
 }
@@ -355,12 +377,15 @@ export function subscribeRoom(supabase, roomId, handlers) {
   const sendPresence = (
     /** @type {import("./sketcharPresence.js").SketcharPresencePayload} */ payload,
   ) => {
-    void presenceChannel.send({
-      type: "broadcast",
-      event: SKETCHAR_PRESENCE_EVENT,
-      payload,
-    });
-    void presenceChannel.httpSend(SKETCHAR_PRESENCE_EVENT, payload).catch(() => {});
+    try {
+      void presenceChannel.send({
+        type: "broadcast",
+        event: SKETCHAR_PRESENCE_EVENT,
+        payload,
+      });
+    } catch (e) {
+      console.warn("[sketchar] sendPresence failed", e);
+    }
   };
 
   return {

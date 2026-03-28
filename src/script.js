@@ -3,17 +3,19 @@ import Axis3d from "lucide/dist/esm/icons/axis-3d.js";
 import Boxes from "lucide/dist/esm/icons/boxes.js";
 import Copy from "lucide/dist/esm/icons/copy.js";
 import Trash2 from "lucide/dist/esm/icons/trash-2.js";
-import Clock from "lucide/dist/esm/icons/clock.js";
 import Grid3x3 from "lucide/dist/esm/icons/grid-3x3.js";
 import Link2 from "lucide/dist/esm/icons/link-2.js";
 import LogIn from "lucide/dist/esm/icons/log-in.js";
 import MapPin from "lucide/dist/esm/icons/map-pin.js";
+import Monitor from "lucide/dist/esm/icons/monitor.js";
+import Smartphone from "lucide/dist/esm/icons/smartphone.js";
 import Menu from "lucide/dist/esm/icons/menu.js";
 import PenLine from "lucide/dist/esm/icons/pen-line.js";
 import Radio from "lucide/dist/esm/icons/radio.js";
 import Users from "lucide/dist/esm/icons/users.js";
 import Undo2 from "lucide/dist/esm/icons/undo-2.js";
 import Redo2 from "lucide/dist/esm/icons/redo-2.js";
+import CloudUpload from "lucide/dist/esm/icons/cloud-upload.js";
 import { TubePainter } from "three/examples/jsm/misc/TubePainter.js";
 import {
   computeGridBoxStrokeMaxVertices,
@@ -27,12 +29,12 @@ import { patchWebXRDepthSensingMeshIfNeeded } from "./misc/xrDepthFeather.js";
 import { HTMLMesh } from "three/examples/jsm/interactive/HTMLMesh.js";
 import { InteractiveGroup } from "three/examples/jsm/interactive/InteractiveGroup.js";
 import { XRButton } from "three/examples/jsm/webxr/XRButton.js";
-import { XRControllerModelFactory } from "three/examples/jsm/webxr/XRControllerModelFactory.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import {
   applyScenePayloadIncremental,
   deserializeSceneV1,
+  disposeSceneGeometrySubtree,
   mergeScenePayloadsForPush,
   mergeScenePayloadsForViewerPoll,
   nodeIdFromPayload,
@@ -47,6 +49,11 @@ import {
   getStrokeMaterialForHex,
   voxelMaterial,
 } from "./shared/strokeMaterial.js";
+import {
+  deleteRoomGlbFromR2,
+  exportSketchToGlbArrayBuffer,
+  uploadGlbArrayBuffer,
+} from "./shared/glbExport.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
 import { loadRoomHistory, rememberRoom } from "./shared/sketcharRoomHistory.js";
 import {
@@ -58,12 +65,14 @@ import {
   preloadPresenceStylusModel,
   pruneStalePresencePeers,
   refreshPresenceVisualsFromStoredPayload,
+  setPresenceLabelRenderer,
   setPresenceTargetsFromPayload,
   setShowOthersPreference,
   SKETCHAR_PRESENCE_HEAD_GLB_URL,
   SKETCHAR_PRESENCE_STYLUS_GLB_URL,
   smoothPresencePeers,
 } from "./shared/sketcharPresence.js";
+import { smoothSceneNetworkTransforms } from "./shared/sceneNetworkTransformSmooth.js";
 import {
   createRoom,
   fetchRoomBySlug,
@@ -116,6 +125,7 @@ const sketcharRemotePeers = new Map();
 const sketcharDeviceId = getOrCreateDeviceId();
 let sketcharShowOthers = getShowOthersPreference();
 let lastPresenceSmoothMs = performance.now();
+let lastSceneNetworkSmoothMs = performance.now();
 
 const sm_middleTip = new THREE.Vector3();
 /** @type {"none"|"one"|"two"} */
@@ -140,6 +150,8 @@ let sm_thDist0 = 1;
 const sm_thMid0 = new THREE.Vector3();
 const sm_thO0 = new THREE.Vector3();
 let sm_thBaseScale = 1;
+/** Last `sceneContentRoot.scale.x` that `refreshAllStrokesTubeGeometryForWorldWidth` was applied for (two-hand manip). */
+let sceneTwoHandStrokeRefreshAtScale = 1;
 const sm_thQuat0 = new THREE.Quaternion();
 const sm_centerLocal = new THREE.Vector3();
 const sm_thPL = new THREE.Vector3();
@@ -154,6 +166,13 @@ const sm_thTargetCenter = new THREE.Vector3();
 const sm_thQuatCombined = new THREE.Quaternion();
 const sm_axis = new THREE.Vector3();
 const sm_anchorScratch = new THREE.Vector3();
+/** Raw thumb–middle anchors before two-hand smoothing (scene manip). */
+const _smRawL = new THREE.Vector3();
+const _smRawR = new THREE.Vector3();
+/** First successful `updateSceneTwoHandGrab` frame: snap smoothed state to raw. */
+let sceneTwoHandSmoothInit = true;
+/** Low-pass of `dist / sm_thDist0` — raw distance jitters while rotating, which looked like scale jitter. */
+let sceneTwoHandScaleSmoothed = 1;
 
 const smSlotL = {
   valid: false,
@@ -179,6 +198,9 @@ let sketcharRoomId = "";
 let sketcharBroadcast = true;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let sketcharPushTimer = null;
+let sketcharGrabTransformPushLastMs = 0;
+let sketcharGrabPushInFlight = false;
+const SKETCHAR_GRAB_TRANSFORM_PUSH_MS = 120;
 /** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
 let sketcharRoomRealtime = null;
 /** @type {string | null} */
@@ -202,6 +224,17 @@ const _stylusWorld = new THREE.Vector3();
 const _stylusLocal = new THREE.Vector3();
 const _stylusQuatWorld = new THREE.Quaternion();
 const _stylusLocalQuat = new THREE.Quaternion();
+const _tipWorld = new THREE.Vector3();
+const _tipLocal = new THREE.Vector3();
+
+/** Order matches presence preview finger spheres (thumb → pinky). */
+const PRESENCE_STREAM_FINGER_JOINTS = [
+  "thumb-tip",
+  "index-finger-tip",
+  "middle-finger-tip",
+  "ring-finger-tip",
+  "pinky-finger-tip",
+];
 
 /** Left-wrist settings panel in XR (HTMLMesh + InteractiveGroup). */
 /** @type {THREE.Group | null} */
@@ -236,15 +269,15 @@ const WRIST_MENU_FOREARM_SHIFT_M = 0.09;
 /** min dot(palmNormal, toCamera) to show menu — palm toward headset. */
 const WRIST_MENU_PALM_FACE_DOT_MIN = 0.52;
 /** Left palm menu: anchor between wrist and middle metacarpal (palm center). */
-const PALM_MENU_CENTER_LERP = 0.5;
+const PALM_MENU_CENTER_LERP = 1.3;
 /** Offset along palm X (thumb +); 0 centers the color wheel on the palm. */
 const PALM_MENU_LATERAL_SHIFT_M = 0;
 /** Palm menu sits slightly farther out along volar normal than the wrist panel. */
-const PALM_MENU_PALM_OFFSET_M = 0.06;
-/** Toward fingertips; 0 keeps wheel centered on volar axis. */
-const PALM_MENU_FINGER_SHIFT_M = 0;
-/** Tip–plane distance must cross this band (m) to count as poking through the HTMLMesh layer. */
-const STYLUS_UI_PLANE_PENETRATE_EPS = 0.002;
+const PALM_MENU_PALM_OFFSET_M = 0.038;
+/** Toward fingertips along forearm/finger axis (m); shifts color wheel onto palm (away from floating above it). */
+const PALM_MENU_FINGER_SHIFT_M = 0.048;
+/** Half-thickness (m) of the touch slab around each HTMLMesh plane: |tipDistance| ≤ this counts as contact. */
+const STYLUS_UI_TOUCH_SLAB_M = 0.005;
 /** Must match `.palm-hue-ring` mask inner radius (SV disc outer radius / wheel radius). */
 const PALM_WHEEL_SV_RADIUS_NORM = 0.76;
 /** Outer edge of hue ring (wheel radius fraction). */
@@ -282,9 +315,9 @@ let wristUiSqueezePrev = false;
 /** True while stylus tip is dragging on the palm color wheel after plane penetration. */
 let palmWheelDragActive = false;
 const _palmWheelLastDragUv = new THREE.Vector2(-1, -1);
-/** Previous-frame signed tip distance to each UI plane (camera-side positive) for penetration clicks. */
-let wristUiPlaneDistPrev = Number.NaN;
-let palmUiPlaneDistPrev = Number.NaN;
+/** Previous frame: stylus tip was inside the touch slab for each UI plane (for rising-edge click). */
+let wristUiTouchSlabPrev = false;
+let palmUiTouchSlabPrev = false;
 const _persistWristUv = new THREE.Vector2();
 let persistWristUvValid = false;
 const _persistPalmUv = new THREE.Vector2();
@@ -292,6 +325,8 @@ let persistPalmUvValid = false;
 const _meshPlaneNormal = new THREE.Vector3();
 const _meshPlaneTipDelta = new THREE.Vector3();
 const _meshPlaneCenter = new THREE.Vector3();
+const _wristUiInvMatrix = new THREE.Matrix4();
+const _tipLocalForUi = new THREE.Vector3();
 /** Last stylus–mesh hit distance (m) after pointer assist; Infinity if no hit. */
 let lastStylusUiWristHitDist = Infinity;
 let lastStylusUiPalmHitDist = Infinity;
@@ -364,6 +399,13 @@ function forcePalmHtmlTextureUpdate() {
   const root = document.getElementById("palm-color-menu");
   if (root) root.setAttribute("data-fresh", String(Date.now()));
   const map = palmHtmlMesh?.material?.map;
+  if (map && typeof map.update === "function") map.update();
+}
+
+function forceWristHtmlTextureUpdate() {
+  const root = document.getElementById("sketchar-advanced");
+  if (root) root.setAttribute("data-fresh", String(Date.now()));
+  const map = wristHtmlMesh?.material?.map;
   if (map && typeof map.update === "function") map.update();
 }
 
@@ -490,6 +532,7 @@ function handleSketcharRemotePresence(p) {
   if (!g) {
     g = new THREE.Group();
     g.name = `peer-${p.deviceId}`;
+    g.userData.isPresencePeerRoot = true;
     remotePresenceGroup.add(g);
     sketcharRemotePeers.set(p.deviceId, g);
   }
@@ -539,6 +582,21 @@ function scheduleSketcharPush() {
   }, 500);
 }
 
+/** While grabbing/moving scene content, push transforms at a low rate so other clients see motion live. */
+function maybePushSketcharDuringGrabTransform() {
+  if (!sketcharBroadcast || !sketcharRoomSlug) return;
+  if (grabMode === "none" || !grabbedMesh) return;
+  if (isStrokeActive() || currentStrokePainter !== null) return;
+  const t = performance.now();
+  if (t - sketcharGrabTransformPushLastMs < SKETCHAR_GRAB_TRANSFORM_PUSH_MS) return;
+  if (sketcharGrabPushInFlight) return;
+  sketcharGrabTransformPushLastMs = t;
+  sketcharGrabPushInFlight = true;
+  void pushSketcharSnapshot().finally(() => {
+    sketcharGrabPushInFlight = false;
+  });
+}
+
 async function pushSketcharSnapshot() {
   if (!sketcharBroadcast || !sketcharRoomSlug || !sketcharRoomId) return;
   /* Defer entire push only while a stroke is in progress (TubePainter / points in flux). Grab does not block upload. */
@@ -585,12 +643,14 @@ async function pushSketcharSnapshot() {
       statusEl.textContent = "Sketchar: synced";
       statusEl.dataset.state = "ok";
     }
+    forceWristHtmlTextureUpdate();
   } catch (e) {
     console.warn("Sketchar push failed", e);
     if (statusEl) {
       statusEl.textContent = "Sketchar: sync error";
       statusEl.dataset.state = "err";
     }
+    forceWristHtmlTextureUpdate();
   }
 }
 
@@ -641,7 +701,10 @@ async function handleSketcharRemoteSnapshot(ev) {
       }
     }
     if (!scenePayloadsEqual(localPayload, merged)) {
-      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup);
+      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup, {
+        smoothNetworkTransforms: true,
+        isLocalAuthority: sceneNetworkIsLocalAuthority,
+      });
     }
     strokesGroup.updateMatrixWorld(true);
     if (at !== null) lastSketcharRemoteSeen = at;
@@ -699,7 +762,10 @@ async function flushSketcharRemote() {
       }
     }
     if (!scenePayloadsEqual(localPayload, merged)) {
-      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup);
+      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup, {
+        smoothNetworkTransforms: true,
+        isLocalAuthority: sceneNetworkIsLocalAuthority,
+      });
     }
     strokesGroup.updateMatrixWorld(true);
     if (at !== null) lastSketcharRemoteSeen = at;
@@ -751,15 +817,15 @@ function initSketcharMenuChrome() {
  * @param {unknown} iconNode
  * @param {number} [sizePx]
  */
-function createLucideSvgDom(iconNode, sizePx = 18) {
+function createLucideSvgDom(iconNode, sizePx = 18, strokeColor = "#e8f0ff") {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("width", String(sizePx));
   svg.setAttribute("height", String(sizePx));
   svg.setAttribute("fill", "none");
-  svg.setAttribute("stroke", "currentColor");
-  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke", strokeColor);
+  svg.setAttribute("stroke-width", "2.25");
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
   if (!Array.isArray(iconNode)) return svg;
@@ -780,8 +846,12 @@ function createLucideSvgDom(iconNode, sizePx = 18) {
 function initSketcharLobbyIcons() {
   const elCreate = document.getElementById("sketchar-create");
   const elJoin = document.getElementById("sketchar-join");
+  const elCreatePreview = document.getElementById("sketchar-create-preview");
+  const elJoinPreview = document.getElementById("sketchar-join-preview");
   const iconCreate = elCreate?.querySelector(".sketchar-btn-icon");
   const iconJoin = elJoin?.querySelector(".sketchar-btn-icon");
+  const iconCreatePreview = elCreatePreview?.querySelector(".sketchar-btn-icon");
+  const iconJoinPreview = elJoinPreview?.querySelector(".sketchar-btn-icon");
   if (iconCreate) {
     iconCreate.replaceChildren();
     const svg = createLucideSvgDom(PenLine, 20);
@@ -794,37 +864,58 @@ function initSketcharLobbyIcons() {
     svg.setAttribute("aria-hidden", "true");
     iconJoin.appendChild(svg);
   }
+  if (iconCreatePreview) {
+    iconCreatePreview.replaceChildren();
+    const svg = createLucideSvgDom(Monitor, 20);
+    svg.setAttribute("aria-hidden", "true");
+    iconCreatePreview.appendChild(svg);
+  }
+  if (iconJoinPreview) {
+    iconJoinPreview.replaceChildren();
+    const svg = createLucideSvgDom(Smartphone, 20);
+    svg.setAttribute("aria-hidden", "true");
+    iconJoinPreview.appendChild(svg);
+  }
 }
 
 function initSketcharAdvancedIcons() {
   const adv = document.getElementById("sketchar-advanced");
-  if (!adv || adv.dataset.lucideIcons === "1") return;
+  if (!adv) return;
+  adv.querySelectorAll(".sketchar-broadcast__ico").forEach((el) => el.remove());
+  adv.querySelectorAll(".sketchar-grid__ico").forEach((el) => el.remove());
   adv.dataset.lucideIcons = "1";
+  const iconStroke = "#e8f0ff";
   const pin = document.getElementById("sketchar-pin-quest");
   const copy = document.getElementById("sketchar-copy");
   if (pin) {
     pin.replaceChildren();
-    pin.appendChild(createLucideSvgDom(MapPin, 20));
+    pin.appendChild(createLucideSvgDom(MapPin, 28, iconStroke));
   }
   if (copy) {
     copy.replaceChildren();
-    copy.appendChild(createLucideSvgDom(Link2, 20));
+    copy.appendChild(createLucideSvgDom(Link2, 28, iconStroke));
   }
   const undoEl = document.getElementById("sketchar-undo");
   const redoEl = document.getElementById("sketchar-redo");
   if (undoEl) {
     undoEl.replaceChildren();
-    undoEl.appendChild(createLucideSvgDom(Undo2, 20));
+    undoEl.appendChild(createLucideSvgDom(Undo2, 28, iconStroke));
   }
   if (redoEl) {
     redoEl.replaceChildren();
-    redoEl.appendChild(createLucideSvgDom(Redo2, 20));
+    redoEl.appendChild(createLucideSvgDom(Redo2, 28, iconStroke));
+  }
+  const exportGlbBtn = document.getElementById("sketchar-export-glb");
+  const exportGlbIcon = exportGlbBtn?.querySelector(".sketchar-wrist-export-cta__icon");
+  if (exportGlbIcon) {
+    exportGlbIcon.replaceChildren();
+    exportGlbIcon.appendChild(createLucideSvgDom(CloudUpload, 26, iconStroke));
   }
   const swLab = document.querySelector(
     "#stroke-width-controls label[for='stroke-width-slider']",
   );
   if (swLab) {
-    const svg = createLucideSvgDom(PenLine, 14);
+    const svg = createLucideSvgDom(PenLine, 14, "#9ec5ff");
     svg.classList.add("sketchar-grid__ico");
     swLab.insertBefore(svg, swLab.firstChild);
   }
@@ -832,19 +923,19 @@ function initSketcharAdvancedIcons() {
   const elShowOthers = document.getElementById("sketchar-show-others");
   if (elBroadcast?.parentElement?.classList.contains("sketchar-broadcast")) {
     const lab = elBroadcast.parentElement;
-    const svg = createLucideSvgDom(Radio, 15);
+    const svg = createLucideSvgDom(Radio, 15, "#8eb8ff");
     svg.classList.add("sketchar-broadcast__ico");
     lab.insertBefore(svg, elBroadcast);
   }
   if (elShowOthers?.parentElement?.classList.contains("sketchar-broadcast")) {
     const lab = elShowOthers.parentElement;
-    const svg = createLucideSvgDom(Users, 15);
+    const svg = createLucideSvgDom(Users, 15, "#8eb8ff");
     svg.classList.add("sketchar-broadcast__ico");
     lab.insertBefore(svg, elShowOthers);
   }
   const gridLab = document.querySelector("#grid-controls label[for='grid-cell-slider']");
   if (gridLab) {
-    const svg = createLucideSvgDom(Grid3x3, 14);
+    const svg = createLucideSvgDom(Grid3x3, 14, "#9ec5ff");
     svg.classList.add("sketchar-grid__ico");
     gridLab.insertBefore(svg, gridLab.firstChild);
   }
@@ -896,6 +987,9 @@ function setupSketcharWristXR() {
   wristMenuGroup.name = "wrist-menu-root";
   wristMenuGroup.add(wristMenuOffsetGroup);
   scene.add(wristMenuGroup);
+  delete adv.dataset.lucideIcons;
+  initSketcharAdvancedIcons();
+  forceWristHtmlTextureUpdate();
 }
 
 function setupPalmMenuXR() {
@@ -949,8 +1043,8 @@ function setupPalmMenuXR() {
 function teardownPalmMenuXR() {
   palmWheelDragActive = false;
   _palmWheelLastDragUv.set(-1, -1);
-  wristUiPlaneDistPrev = Number.NaN;
-  palmUiPlaneDistPrev = Number.NaN;
+  wristUiTouchSlabPrev = false;
+  palmUiTouchSlabPrev = false;
   persistWristUvValid = false;
   persistPalmUvValid = false;
   const palmEl = document.getElementById("palm-color-menu");
@@ -1069,6 +1163,86 @@ function updateWristMenuPose(frame, session) {
 /**
  * @param {XRFrame} frame
  * @param {XRSession} session
+ * @param {XRReferenceSpace} refSpace
+ * @returns {boolean}
+ */
+function tryRightWristHudFromHand(frame, session, refSpace) {
+  /* Hide HUD while MX Ink is in the right hand; only show when that wrist is free (hand tracking only). */
+  if (stylusHandedness === "right" && stylus) return false;
+
+  let src = null;
+  for (const inputSource of session.inputSources) {
+    if (inputSource.hand && inputSource.handedness === "right") {
+      src = inputSource;
+      break;
+    }
+  }
+  if (!src) return false;
+  const hand = src.hand;
+  const wristSpace = hand.get("wrist");
+  const middleSpace = hand.get("middle-finger-metacarpal");
+  const indexSpace = hand.get("index-finger-metacarpal");
+  if (!wristSpace || !middleSpace || !indexSpace) return false;
+  const wristPose = frame.getPose(wristSpace, refSpace);
+  const middlePose = frame.getPose(middleSpace, refSpace);
+  const indexPose = frame.getPose(indexSpace, refSpace);
+  if (!wristPose || !middlePose || !indexPose) return false;
+
+  const wp = wristPose.transform.position;
+  _wristMenuPos.set(wp.x, wp.y, wp.z);
+  const mp = middlePose.transform.position;
+  _wristMiddleMeta.set(mp.x, mp.y, mp.z);
+  const ip = indexPose.transform.position;
+  _wristIndexMeta.set(ip.x, ip.y, ip.z);
+
+  _wristToMiddle.subVectors(_wristMiddleMeta, _wristMenuPos);
+  _wristToIndex.subVectors(_wristIndexMeta, _wristMenuPos);
+  _wristPalmNormal.crossVectors(_wristToIndex, _wristToMiddle);
+  if (_wristPalmNormal.lengthSq() < 1e-10) return false;
+  _wristPalmNormal.normalize();
+
+  camera.getWorldPosition(_wristToCamera);
+  _wristToCamera.sub(_wristMenuPos).normalize();
+
+  if (_wristPalmNormal.dot(_wristToCamera) < WRIST_MENU_PALM_FACE_DOT_MIN) return false;
+
+  _wristToMiddle.normalize();
+  _wristZ.copy(_wristPalmNormal);
+  _wristY.copy(_wristToMiddle);
+  _wristX.crossVectors(_wristY, _wristZ).normalize();
+  _wristY.crossVectors(_wristZ, _wristX).normalize();
+  _wristBasis.makeBasis(_wristX, _wristY, _wristZ);
+  hudGroup.quaternion.setFromRotationMatrix(_wristBasis);
+
+  _wristMenuScratchPos.copy(_wristZ).multiplyScalar(HUD_WRIST_PALM_OFFSET_M);
+  _wristMenuScratchPos.addScaledVector(_wristY, HUD_WRIST_FINGER_SHIFT_M);
+  _wristMenuScratchPos.addScaledVector(_wristY, -HUD_WRIST_FOREARM_SHIFT_M);
+  hudGroup.position.copy(_wristMenuPos).add(_wristMenuScratchPos);
+  return true;
+}
+
+/**
+ * Right-wrist HUD: right hand tracking only, palm toward camera; hidden while MX Ink is in the right hand.
+ * @param {XRFrame} frame
+ * @param {XRSession} session
+ */
+function updateRightWristHudPose(frame, session) {
+  if (!hudGroup) return;
+  const refSpace = renderer.xr.getReferenceSpace();
+  if (!refSpace) {
+    hudGroup.visible = false;
+    return;
+  }
+  if (tryRightWristHudFromHand(frame, session, refSpace)) {
+    hudGroup.visible = true;
+    return;
+  }
+  hudGroup.visible = false;
+}
+
+/**
+ * @param {XRFrame} frame
+ * @param {XRSession} session
  */
 function updatePalmMenuPose(frame, session) {
   if (!palmMenuGroup) return;
@@ -1159,18 +1333,34 @@ function updateWristPalmMenuStylusPointerAssist() {
 
   let distW = Infinity;
   let distP = Infinity;
-  /** @type {import("three").Intersection | undefined} */
-  let hitW;
-  /** @type {import("three").Intersection | undefined} */
-  let hitP;
+  let wristHit = false;
+  let palmHit = false;
+  let wristFromRay = false;
+  let palmFromRay = false;
+  /** @type {import("three").Vector2 | undefined} */
+  let wristUvThree;
+  /** @type {import("three").Vector2 | undefined} */
+  let palmUvThree;
 
   if (wristMenuGroup?.visible && wristHtmlMesh) {
     wristMenuGroup.updateMatrixWorld(true);
     wristHtmlMesh.updateMatrixWorld(true);
     const hw = wristUiRaycaster.intersectObject(wristHtmlMesh, false);
     if (hw.length > 0) {
-      hitW = hw[0];
-      distW = hitW.distance;
+      wristHit = true;
+      wristFromRay = true;
+      distW = hw[0].distance;
+      wristUvThree = hw[0].uv;
+    } else {
+      const dW = getTipSignedDistanceToMeshPlane(wristHtmlMesh);
+      if (
+        Number.isFinite(dW) &&
+        Math.abs(dW) <= STYLUS_UI_TOUCH_SLAB_M &&
+        tipWorldToHtmlMeshUv(wristHtmlMesh, _wristUiOrigin, wristMenuLastUv)
+      ) {
+        wristHit = true;
+        distW = Math.abs(dW);
+      }
     }
   }
   if (palmMenuGroup?.visible && palmHtmlMesh) {
@@ -1178,20 +1368,34 @@ function updateWristPalmMenuStylusPointerAssist() {
     palmHtmlMesh.updateMatrixWorld(true);
     const hp = wristUiRaycaster.intersectObject(palmHtmlMesh, false);
     if (hp.length > 0) {
-      hitP = hp[0];
-      distP = hitP.distance;
+      palmHit = true;
+      palmFromRay = true;
+      distP = hp[0].distance;
+      palmUvThree = hp[0].uv;
+    } else {
+      const dP = getTipSignedDistanceToMeshPlane(palmHtmlMesh);
+      if (
+        Number.isFinite(dP) &&
+        Math.abs(dP) <= STYLUS_UI_TOUCH_SLAB_M &&
+        tipWorldToHtmlMeshUv(palmHtmlMesh, _wristUiOrigin, palmMenuLastUv)
+      ) {
+        palmHit = true;
+        distP = Math.abs(dP);
+      }
     }
   }
 
-  if (distW < Infinity && distW <= distP && hitW) {
-    const uv = hitW.uv;
-    wristMenuLastUv.set(uv.x, 1 - uv.y);
+  if (wristHit && distW <= distP) {
+    if (wristFromRay && wristUvThree) {
+      wristMenuLastUv.set(wristUvThree.x, 1 - wristUvThree.y);
+    }
     wristMenuUvValid = true;
     lastStylusUiMesh = wristHtmlMesh;
     lastStylusUiWristHitDist = distW;
-  } else if (distP < Infinity && hitP) {
-    const uv = hitP.uv;
-    palmMenuLastUv.set(uv.x, 1 - uv.y);
+  } else if (palmHit) {
+    if (palmFromRay && palmUvThree) {
+      palmMenuLastUv.set(palmUvThree.x, 1 - palmUvThree.y);
+    }
     palmMenuUvValid = true;
     lastStylusUiMesh = palmHtmlMesh;
     lastStylusUiPalmHitDist = distP;
@@ -1217,14 +1421,26 @@ function getTipSignedDistanceToMeshPlane(mesh) {
   return _meshPlaneTipDelta.dot(_meshPlaneNormal);
 }
 
-function stylusUiPlaneCrossed(prevD, currD) {
-  return (
-    !Number.isNaN(prevD) &&
-    !Number.isNaN(currD) &&
-    prevD * currD < 0 &&
-    Math.abs(prevD) > STYLUS_UI_PLANE_PENETRATE_EPS &&
-    Math.abs(currD) > STYLUS_UI_PLANE_PENETRATE_EPS
-  );
+/**
+ * Project stylus tip onto HTMLMesh plane in local space; UV matches Three.js PlaneGeometry + same Y flip as raycast.
+ * @param {THREE.Mesh} mesh
+ * @param {THREE.Vector3} tipWorld
+ * @param {THREE.Vector2} outDomUv output (u, 1-v_three) for {@link dispatchHtmlMeshPointerEvent}
+ * @returns {boolean}
+ */
+function tipWorldToHtmlMeshUv(mesh, tipWorld, outDomUv) {
+  const geom = mesh.geometry;
+  const w = geom?.parameters?.width;
+  const h = geom?.parameters?.height;
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return false;
+  mesh.updateMatrixWorld(true);
+  _wristUiInvMatrix.copy(mesh.matrixWorld).invert();
+  _tipLocalForUi.copy(tipWorld).applyMatrix4(_wristUiInvMatrix);
+  const uThree = _tipLocalForUi.x / w + 0.5;
+  const vThree = 0.5 - _tipLocalForUi.y / h;
+  if (uThree < -1e-3 || uThree > 1 + 1e-3 || vThree < -1e-3 || vThree > 1 + 1e-3) return false;
+  outDomUv.set(uThree, 1 - vThree);
+  return true;
 }
 
 /**
@@ -1240,7 +1456,7 @@ function dispatchHtmlMeshPointerEvent(mesh, uv, syntheticType) {
 }
 
 /**
- * Wrist / palm HTMLMesh: treat MX Ink tip passing through the panel plane as click (not squeeze).
+ * Wrist / palm HTMLMesh: MX Ink tip enters touch slab near the panel → one click (rising edge), not plane penetration.
  */
 function processStylusUiPlanePenetration() {
   if (!stylus) return;
@@ -1257,8 +1473,19 @@ function processStylusUiPlanePenetration() {
     dP = getTipSignedDistanceToMeshPlane(palmHtmlMesh);
   }
 
-  const wristCross = stylusUiPlaneCrossed(wristUiPlaneDistPrev, dW);
-  const palmCross = stylusUiPlaneCrossed(palmUiPlaneDistPrev, dP);
+  const wristInSlab =
+    wristMenuGroup?.visible &&
+    wristHtmlMesh &&
+    Number.isFinite(dW) &&
+    Math.abs(dW) <= STYLUS_UI_TOUCH_SLAB_M;
+  const palmInSlab =
+    palmMenuGroup?.visible &&
+    palmHtmlMesh &&
+    Number.isFinite(dP) &&
+    Math.abs(dP) <= STYLUS_UI_TOUCH_SLAB_M;
+
+  const wristSlabEdge = wristInSlab && !wristUiTouchSlabPrev;
+  const palmSlabEdge = palmInSlab && !palmUiTouchSlabPrev;
 
   const wristEligible =
     (wristMenuUvValid && lastStylusUiMesh === wristHtmlMesh) || persistWristUvValid;
@@ -1281,9 +1508,9 @@ function processStylusUiPlanePenetration() {
   };
 
   let didWrist = false;
-  if (wristCross && wristEligible) {
+  if (wristSlabEdge && wristEligible) {
     const uv = pickWristUv();
-    const palmAlso = palmCross && palmEligible;
+    const palmAlso = palmSlabEdge && palmEligible;
     const palmCloser =
       palmAlso &&
       Number.isFinite(lastStylusUiWristHitDist) &&
@@ -1295,10 +1522,11 @@ function processStylusUiPlanePenetration() {
       dispatchHtmlMeshPointerEvent(wristHtmlMesh, uv, "mouseup");
       dispatchHtmlMeshPointerEvent(wristHtmlMesh, uv, "click");
       didWrist = true;
+      forceWristHtmlTextureUpdate();
     }
   }
 
-  if (!didWrist && palmCross && palmEligible) {
+  if (!didWrist && palmSlabEdge && palmEligible) {
     const uv = pickPalmUv();
     if (uv) {
       palmWheelDragActive = true;
@@ -1315,8 +1543,8 @@ function processStylusUiPlanePenetration() {
     forcePalmHtmlTextureUpdate();
   }
 
-  wristUiPlaneDistPrev = wristMenuGroup?.visible && wristHtmlMesh ? dW : Number.NaN;
-  palmUiPlaneDistPrev = palmMenuGroup?.visible && palmHtmlMesh ? dP : Number.NaN;
+  wristUiTouchSlabPrev = wristInSlab;
+  palmUiTouchSlabPrev = palmInSlab;
 
   if (wristMenuUvValid && lastStylusUiMesh === wristHtmlMesh) {
     _persistWristUv.copy(wristMenuLastUv);
@@ -1416,6 +1644,8 @@ function syncPalmPaletteSelectedUi() {
 function initSketcharUI() {
   const elCreate = document.getElementById("sketchar-create");
   const elJoin = document.getElementById("sketchar-join");
+  const elCreatePreview = document.getElementById("sketchar-create-preview");
+  const elJoinPreview = document.getElementById("sketchar-join-preview");
   const elSlug = document.getElementById("sketchar-slug");
   const elBroadcast = document.getElementById("sketchar-broadcast");
   const elCopy = document.getElementById("sketchar-copy");
@@ -1476,6 +1706,7 @@ function initSketcharUI() {
       if (sketcharBroadcast) {
         scheduleSketcharPush();
       }
+      forceWristHtmlTextureUpdate();
     });
   }
   const elShowOthers = document.getElementById("sketchar-show-others");
@@ -1485,6 +1716,7 @@ function initSketcharUI() {
       sketcharShowOthers = elShowOthers.checked;
       setShowOthersPreference(sketcharShowOthers);
       remotePresenceGroup.visible = sketcharShowOthers;
+      forceWristHtmlTextureUpdate();
     });
   }
   const elOriginFloor = document.getElementById("sketchar-origin-floor");
@@ -1508,6 +1740,7 @@ function initSketcharUI() {
       } catch (_) {
         /* ignore */
       }
+      forceWristHtmlTextureUpdate();
     });
   }
   const elPickDebug = document.getElementById("sketchar-pick-debug");
@@ -1531,6 +1764,7 @@ function initSketcharUI() {
       } catch (_) {
         /* ignore */
       }
+      forceWristHtmlTextureUpdate();
     });
   }
   async function applyJoinSuccess(data, canonical) {
@@ -1560,6 +1794,7 @@ function initSketcharUI() {
         : "Sketchar: room empty — draw to sync";
       statusEl.dataset.state = "ok";
     }
+    forceWristHtmlTextureUpdate();
     rememberRoom(canonical);
     renderSketcharRecentRooms();
     invalidateHudClock();
@@ -1579,16 +1814,36 @@ function initSketcharUI() {
     }
     for (const { code } of items) {
       const li = document.createElement("li");
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "sketchar-recent-item";
-      btn.textContent = code;
-      btn.title = `Join room ${code}`;
-      btn.addEventListener("click", () => {
+      li.className = "sketchar-recent-row";
+      const codeEl = document.createElement("span");
+      codeEl.className = "sketchar-recent-code";
+      codeEl.textContent = code;
+      const actions = document.createElement("div");
+      actions.className = "sketchar-recent-actions";
+      const btnXr = document.createElement("button");
+      btnXr.type = "button";
+      btnXr.className = "sketchar-recent-btn sketchar-recent-btn--xr";
+      btnXr.textContent = "XR";
+      btnXr.title = `Join room ${code} in XR`;
+      btnXr.setAttribute("aria-label", `Join room ${code} in XR`);
+      btnXr.addEventListener("click", () => {
         elSlug.value = code;
         void joinRoomAndEnterXr();
       });
-      li.appendChild(btn);
+      const btnPreview = document.createElement("button");
+      btnPreview.type = "button";
+      btnPreview.className = "sketchar-recent-btn sketchar-recent-btn--preview";
+      btnPreview.textContent = "Preview";
+      btnPreview.title = `Open preview for room ${code}`;
+      btnPreview.setAttribute("aria-label", `Open room ${code} in preview viewer`);
+      btnPreview.addEventListener("click", () => {
+        elSlug.value = code;
+        void joinRoomPreviewWithCode(code);
+      });
+      actions.appendChild(btnXr);
+      actions.appendChild(btnPreview);
+      li.appendChild(codeEl);
+      li.appendChild(actions);
       recentList.appendChild(li);
     }
   }
@@ -1613,6 +1868,7 @@ function initSketcharUI() {
         if (statusEl) {
           statusEl.textContent = "Sketchar: room not found";
           statusEl.dataset.state = "err";
+          forceWristHtmlTextureUpdate();
         } else {
           alert("Room not found.");
         }
@@ -1625,6 +1881,7 @@ function initSketcharUI() {
       if (statusEl) {
         statusEl.textContent = "Sketchar: could not load room";
         statusEl.dataset.state = "err";
+        forceWristHtmlTextureUpdate();
       } else {
         alert("Could not load room. Check Supabase env.");
       }
@@ -1661,10 +1918,80 @@ function initSketcharUI() {
         statusEl.textContent = "Sketchar: new room — draw to sync";
         statusEl.dataset.state = "ok";
       }
+      forceWristHtmlTextureUpdate();
       rememberRoom(sketcharRoomSlug);
       renderSketcharRecentRooms();
       invalidateHudClock();
       await startImmersiveSession();
+    } catch (e) {
+      console.warn("Sketchar create room failed", e);
+      alert("Could not create room. Check Supabase env and project.");
+    }
+  }
+
+  async function joinRoomPreview() {
+    const normalized = normalizeRoomCode(elSlug.value || "");
+    if (!normalized) {
+      alert("Enter a room code.");
+      return;
+    }
+    if (!isSketcharConfigured()) {
+      alert(
+        "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+      );
+      return;
+    }
+    const sb = getSketcharSupabase();
+    if (!sb) return;
+    try {
+      const data = await fetchRoomBySlug(sb, normalized);
+      if (!data) {
+        if (statusEl) {
+          statusEl.textContent = "Sketchar: room not found";
+          statusEl.dataset.state = "err";
+          forceWristHtmlTextureUpdate();
+        } else {
+          alert("Room not found.");
+        }
+        return;
+      }
+      const canonical = normalizeRoomCode(data.slug);
+      elSlug.value = canonical;
+      rememberRoom(canonical);
+      renderSketcharRecentRooms();
+      location.assign(viewerUrlForRoomSlug(canonical));
+    } catch (e) {
+      console.warn("Sketchar join preview failed", e);
+      if (statusEl) {
+        statusEl.textContent = "Sketchar: could not load room";
+        statusEl.dataset.state = "err";
+        forceWristHtmlTextureUpdate();
+      } else {
+        alert("Could not load room. Check Supabase env.");
+      }
+    }
+  }
+
+  async function joinRoomPreviewWithCode(code) {
+    elSlug.value = code;
+    await joinRoomPreview();
+  }
+
+  async function createNewSketchPreview() {
+    if (!isSketcharConfigured()) {
+      alert(
+        "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+      );
+      return;
+    }
+    const sb = getSketcharSupabase();
+    if (!sb) return;
+    try {
+      const { slug } = await createRoom(sb);
+      const canonical = normalizeRoomCode(slug);
+      rememberRoom(canonical);
+      renderSketcharRecentRooms();
+      location.assign(viewerUrlForRoomSlug(canonical));
     } catch (e) {
       console.warn("Sketchar create room failed", e);
       alert("Could not create room. Check Supabase env and project.");
@@ -1679,6 +2006,16 @@ function initSketcharUI() {
   if (elJoin) {
     elJoin.addEventListener("click", () => {
       void joinRoomAndEnterXr();
+    });
+  }
+  if (elCreatePreview) {
+    elCreatePreview.addEventListener("click", () => {
+      void createNewSketchPreview();
+    });
+  }
+  if (elJoinPreview) {
+    elJoinPreview.addEventListener("click", () => {
+      void joinRoomPreview();
     });
   }
   renderSketcharRecentRooms();
@@ -1720,6 +2057,72 @@ function initSketcharUI() {
       redoLastStroke();
     });
   }
+  const elExportGlb = document.getElementById("sketchar-export-glb");
+  if (elExportGlb) {
+    const syncExportGlbDisabled = () => {
+      const raw = import.meta.env.VITE_EXPORT_GLB_URL;
+      const url = typeof raw === "string" ? raw.trim() : "";
+      elExportGlb.disabled = !url;
+    };
+    syncExportGlbDisabled();
+    elExportGlb.addEventListener("click", async () => {
+      const rawUrl = import.meta.env.VITE_EXPORT_GLB_URL;
+      const rawTok = import.meta.env.VITE_EXPORT_GLB_TOKEN;
+      const exportUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
+      const exportTok = typeof rawTok === "string" ? rawTok.trim() : "";
+      if (!exportUrl) {
+        if (statusEl) {
+          statusEl.textContent =
+            "GLB export: set VITE_EXPORT_GLB_URL in project-root .env.local";
+          statusEl.dataset.state = "err";
+          forceWristHtmlTextureUpdate();
+        }
+        return;
+      }
+      elExportGlb.disabled = true;
+      elExportGlb.dataset.state = "uploading";
+      if (statusEl) {
+        statusEl.textContent = "GLB export: encoding…";
+        statusEl.removeAttribute("data-state");
+        forceWristHtmlTextureUpdate();
+      }
+      try {
+        const buffer = await exportSketchToGlbArrayBuffer(sceneContentRoot, strokesGroup);
+        if (statusEl) {
+          statusEl.textContent = "GLB export: uploading…";
+          forceWristHtmlTextureUpdate();
+        }
+        const result = await uploadGlbArrayBuffer(buffer, {
+          url: exportUrl,
+          token: exportTok,
+          roomSlug: sketcharRoomSlug || "",
+        });
+        const key = result && typeof result.key === "string" ? result.key : "";
+        const pubUrl = result && typeof result.url === "string" ? result.url : "";
+        if (statusEl) {
+          statusEl.textContent = pubUrl
+            ? `GLB export: saved — ${pubUrl}`
+            : key
+              ? `GLB export: saved (${key})`
+              : "GLB export: saved";
+          statusEl.dataset.state = "ok";
+          forceWristHtmlTextureUpdate();
+        }
+      } catch (e) {
+        console.warn("GLB export failed", e);
+        if (statusEl) {
+          const msg = e && typeof e.message === "string" ? e.message : String(e);
+          statusEl.textContent = "GLB export failed: " + msg;
+          statusEl.dataset.state = "err";
+          forceWristHtmlTextureUpdate();
+        }
+      } finally {
+        delete elExportGlb.dataset.state;
+        syncExportGlbDisabled();
+        forceWristHtmlTextureUpdate();
+      }
+    });
+  }
   updateStrokeUndoRedoButtons();
   updateSketcharViewerLink(elViewerLink);
   initSketcharMenuChrome();
@@ -1727,15 +2130,21 @@ function initSketcharUI() {
   initSketcharAdvancedIcons();
 }
 
+function viewerUrlForRoomSlug(slug) {
+  const u = new URL("viewer.html", window.location.href);
+  u.searchParams.set("room", slug);
+  return u.href;
+}
+
 function updateSketcharViewerLink(elViewerLink) {
   if (!elViewerLink) return;
   if (!sketcharRoomSlug) {
     elViewerLink.textContent = "—";
+    forceWristHtmlTextureUpdate();
     return;
   }
-  const u = new URL("viewer.html", window.location.href);
-  u.searchParams.set("room", sketcharRoomSlug);
-  elViewerLink.textContent = u.href;
+  elViewerLink.textContent = viewerUrlForRoomSlug(sketcharRoomSlug);
+  forceWristHtmlTextureUpdate();
 }
 
 let currentStrokePainter = null;
@@ -1851,6 +2260,8 @@ const _eraseWorld = new THREE.Vector3();
 const _axis = new THREE.Vector3();
 const thQuatCombined = new THREE.Quaternion();
 const _centerLocal = new THREE.Vector3();
+/** World AABB for GLB grab roots (Groups have no mesh.geometry). */
+const _gltfGrabBounds = new THREE.Box3();
 const _penForward = new THREE.Vector3();
 const _snapDeltaWorld = new THREE.Vector3();
 const _snapTargetCenter = new THREE.Vector3();
@@ -1859,13 +2270,16 @@ const _snapPreWorld = new THREE.Vector3();
 const _qWorldGrab = new THREE.Quaternion();
 const _qSnapRot = new THREE.Quaternion();
 const _eulerGrabSnap = new THREE.Euler();
-const _eulerHud = new THREE.Euler();
 const _snapParentQuat = new THREE.Quaternion();
 
 const PINCH_CLOSE_DIST = 0.015;
 const PINCH_OPEN_DIST = 0.025;
 const SCENE_MANIP_SCALE_MIN = 0.05;
 const SCENE_MANIP_SCALE_MAX = 5;
+/** EMA blend toward raw thumb–middle anchors per frame (reduces hand-tracking noise during world yaw). */
+const SCENE_TWO_HAND_HAND_SMOOTH = 0.38;
+/** EMA blend toward raw pinch scale ratio — inter-hand distance wiggles when rotating, not only when scaling. */
+const SCENE_TWO_HAND_SCALE_SMOOTH = 0.32;
 
 /**
  * Single world-space lattice: `cellSize = GRID_WORLD_EXTENT / divisions` (only source of truth).
@@ -2007,20 +2421,35 @@ let hudTimePlane = null;
 let hudLastClockSec = -1;
 let hudLastRoomDisplay = "";
 let hudLastContentScale = -1;
-let hudLastContentYawDeg = Number.NaN;
 /** Camera-local anchor: +Y up, −Z forward (m). */
 const HUD_LOCAL_OFFSET = new THREE.Vector3(0, 0.12, -2);
 /** World size vs previous design (0.38 m tall): 70% smaller → 30% scale. */
 const HUD_WORLD_SCALE = 0.3;
+/** Figma 10:9 frame 256×347 design units; 3× raster for sharpness; extra vertical room for spacing. */
+const HUD_CANVAS_W = 768;
+const HUD_CANVAS_H = 1240;
+/** Narrow edge world width (m) for vertical wrist HUD strip. */
+const HUD_WRIST_PLANE_WIDTH_M = 0.09;
+/** Wrist HUD: closer to skin than settings panel; shifted toward forearm/elbow. */
+const HUD_WRIST_PALM_OFFSET_M = 0.03;
+const HUD_WRIST_FINGER_SHIFT_M = 0.019;
+const HUD_WRIST_FOREARM_SHIFT_M = 0.132;
+/** Staggered pill entrance timing (ms). */
+const HUD_PILL_STAGGER_DELAY_MS = 150;
+const HUD_PILL_ENTER_DURATION_MS = 520;
+/** Keep redrawing while entrance animation runs (ms). */
+const HUD_APPEAR_TOTAL_MS = 1850;
 /** Exponential follow ~stiffness (higher = snappier). */
 const HUD_FOLLOW_LAMBDA = 6.5;
 const _hudTargetWorld = new THREE.Vector3();
 const _hudTargetQuat = new THREE.Quaternion();
 let hudFollowLastMs = null;
-/** Preloaded wordmark for HUD center (`/sketchar-logo.svg`). */
+/** Preload Sketchar wordmark for wrist HUD (`/sketchar-logo.svg`). */
 let hudLogoImage = null;
-/** Cache-bust query so Quest/browser picks up updated SVG after deploy. */
 const SKETCHAR_LOGO_URL = "/sketchar-logo.svg?v=1";
+/** @type {number | null} */
+let hudAppearStartMs = null;
+let hudAppearPrevVisible = false;
 
 function ensureHudLogoImage() {
   if (hudLogoImage) return;
@@ -2033,6 +2462,37 @@ function ensureHudLogoImage() {
   };
   img.src = SKETCHAR_LOGO_URL;
   hudLogoImage = img;
+}
+
+/**
+ * @param {number} nowMs
+ */
+function tickHudAppearState(nowMs) {
+  if (!hudGroup) return;
+  if (!hudGroup.visible) {
+    hudAppearPrevVisible = false;
+    return;
+  }
+  if (!hudAppearPrevVisible) {
+    hudAppearStartMs = nowMs;
+  }
+  hudAppearPrevVisible = true;
+}
+
+/** @param {number} t */
+function hudSmoothStep01(t) {
+  const u = Math.max(0, Math.min(1, t));
+  return u * u * (3 - 2 * u);
+}
+
+/**
+ * @param {number} elapsedMs
+ * @param {number} index
+ */
+function hudPillEnterPhase(elapsedMs, index) {
+  const delay = index * HUD_PILL_STAGGER_DELAY_MS;
+  const dur = HUD_PILL_ENTER_DURATION_MS;
+  return hudSmoothStep01((elapsedMs - delay) / dur);
 }
 
 function initOriginGizmoAndFloor() {
@@ -2213,8 +2673,8 @@ function makeFingerLabelSprite(text) {
 
 function createTimeHud() {
   const canvas = document.createElement("canvas");
-  canvas.width = 1600;
-  canvas.height = 168;
+  canvas.width = HUD_CANVAS_W;
+  canvas.height = HUD_CANVAS_H;
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
   const tex = new THREE.CanvasTexture(canvas);
@@ -2224,10 +2684,8 @@ function createTimeHud() {
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
-  // 2 m viewing distance; plane size scaled by HUD_WORLD_SCALE (70% smaller than prior).
-  const planeH = 0.38 * HUD_WORLD_SCALE;
-  const aspect = canvas.width / canvas.height;
-  const planeW = planeH * aspect;
+  const planeW = HUD_WRIST_PLANE_WIDTH_M * HUD_WORLD_SCALE / 0.3;
+  const planeH = planeW * (canvas.height / canvas.width);
   const geom = new THREE.PlaneGeometry(planeW, planeH);
   const mat = new THREE.MeshBasicMaterial({
     map: tex,
@@ -2243,7 +2701,6 @@ function createTimeHud() {
   mesh.userData.hudCanvas = canvas;
   mesh.userData.hudCtx = ctx;
   mesh.userData.hudTex = tex;
-  mesh.userData.hudClockIcon = Clock;
   const group = new THREE.Group();
   group.name = "hud-time";
   group.frustumCulled = false;
@@ -2253,11 +2710,26 @@ function createTimeHud() {
 }
 
 /**
- * Ease HUD position/orientation toward the rigid head-locked target (camera-local offset).
- * Call each frame before render; uses exponential smoothing for a slight lag behind the head.
+ * XR: right-wrist pose. Non-XR: ease HUD toward camera-local offset.
+ * @param {number} timeMs
+ * @param {XRFrame | undefined} frame
  */
-function updateHudFollow(timeMs) {
+function updateHudFollow(timeMs, frame) {
   if (!hudGroup) return;
+
+  if (renderer?.xr?.isPresenting) {
+    if (frame) {
+      const session = renderer.xr.getSession();
+      if (session) {
+        updateRightWristHudPose(frame, session);
+        return;
+      }
+    }
+    hudGroup.visible = false;
+    return;
+  }
+
+  hudGroup.visible = true;
   const t = typeof timeMs === "number" && Number.isFinite(timeMs) ? timeMs : performance.now();
   const dtSec =
     hudFollowLastMs == null ? 0 : Math.min(0.1, Math.max(0, (t - hudFollowLastMs) * 0.001));
@@ -2282,188 +2754,141 @@ function invalidateHudClock() {
   hudLastClockSec = -1;
   hudLastRoomDisplay = "";
   hudLastContentScale = -1;
-  hudLastContentYawDeg = Number.NaN;
   updateHudClock();
 }
 
 function updateHudClock() {
   if (!hudTimePlane) return;
-  const { hudCanvas: canvas, hudCtx: ctx, hudTex: tex, hudClockIcon: iconNode } = hudTimePlane.userData;
+  const { hudCanvas: canvas, hudCtx: ctx, hudTex: tex } = hudTimePlane.userData;
   if (!canvas || !ctx || !tex) return;
   const t = Math.floor(Date.now() / 1000);
   const roomDisp = sketcharRoomSlug || "";
   const contentScale = sceneContentRoot.scale.x;
-  _eulerHud.setFromQuaternion(sceneContentRoot.quaternion, "YXZ");
-  const yawDeg = Math.round((_eulerHud.y * 180) / Math.PI * 100) / 100;
+  /** Match `toFixed(2)` in the HUD — tiny float drift during two-hand world manip was forcing a full canvas redraw every frame. */
+  const contentScaleKey = Number(contentScale.toFixed(2));
+  const now = performance.now();
+  const elapsed =
+    hudAppearStartMs != null && hudGroup?.visible ? now - hudAppearStartMs : HUD_APPEAR_TOTAL_MS + 1;
+  const animating = elapsed < HUD_APPEAR_TOTAL_MS;
+  const logoImg = hudLogoImage;
+  const logoPending = !!(logoImg && !logoImg.complete);
   if (
+    !animating &&
+    !logoPending &&
     t === hudLastClockSec &&
     roomDisp === hudLastRoomDisplay &&
-    Math.abs(contentScale - hudLastContentScale) < 1e-4 &&
-    Number.isFinite(hudLastContentYawDeg) &&
-    Math.abs(yawDeg - hudLastContentYawDeg) < 0.01
+    contentScaleKey === hudLastContentScale
   ) {
     return;
   }
   hudLastClockSec = t;
   hudLastRoomDisplay = roomDisp;
-  hudLastContentScale = contentScale;
-  hudLastContentYawDeg = yawDeg;
-  const timeStr = new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  hudLastContentScale = contentScaleKey;
+  const timeStr = new Date().toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
   const w = canvas.width;
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  const margin = 10;
-  const rx = 26;
-  const x0 = margin;
-  const y0 = margin;
-  const bw = w - margin * 2;
-  const bh = h - margin * 2;
+  const pillBorder = "rgba(47, 47, 47, 0.92)";
+  const pillFill = "rgba(20, 20, 24, 0.82)";
+  const textMuted = "#c8c8d0";
+  const borderW = 9;
 
-  const g = ctx.createLinearGradient(x0, y0, x0 + bw, y0 + bh);
-  g.addColorStop(0, "rgba(18, 24, 34, 0.94)");
-  g.addColorStop(0.5, "rgba(12, 16, 24, 0.92)");
-  g.addColorStop(1, "rgba(8, 11, 18, 0.9)");
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.roundRect(x0, y0, bw, bh, rx);
-  ctx.fill();
+  const cx = w * 0.5;
+  const logoPhase = hudSmoothStep01(elapsed / 520);
 
-  ctx.save();
-  ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
-  ctx.shadowBlur = 18;
-  ctx.shadowOffsetY = 4;
-  ctx.strokeStyle = "rgba(120, 190, 255, 0.45)";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.roundRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1, rx - 0.5);
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(x0 + 1.5, y0 + 1.5, bw - 3, bh - 3, rx - 2);
-  ctx.stroke();
-
-  const iconPx = 64;
-  const iconPad = 28;
-  const iconY = h / 2 - iconPx / 2;
-  ctx.save();
-  ctx.translate(iconPad, iconY);
-  ctx.scale(iconPx / 24, iconPx / 24);
-  ctx.strokeStyle = "rgba(186, 220, 255, 0.95)";
-  ctx.fillStyle = "rgba(186, 220, 255, 0.95)";
-  ctx.lineWidth = 2;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  if (iconNode) {
-    drawLucideIconNode(ctx, iconNode);
-  }
-  ctx.restore();
-
-  const textX = iconPad + iconPx + 22;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  ctx.font = '600 52px "SF Pro Display", system-ui, sans-serif';
-  ctx.fillStyle = "rgba(248, 250, 255, 0.98)";
-  ctx.fillText(timeStr, textX, h / 2 - 10);
-  ctx.font = '500 15px system-ui, sans-serif';
-  ctx.fillStyle = "rgba(180, 195, 220, 0.65)";
-  ctx.fillText("Local time", textX, h / 2 + 24);
-
-  const leftDividerX = Math.round(w * 0.325);
-  const rightDividerX = Math.round(w * 0.7);
-  const colW = rightDividerX - leftDividerX;
-  const cxMid = (leftDividerX + rightDividerX) * 0.5;
-  const logoImg = hudLogoImage;
-  let scaleBlockTop = y0 + 16;
-  if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
-    const maxLogoW = Math.min(300, colW - 28);
+  const logoImgOk = logoImg && logoImg.complete && logoImg.naturalWidth > 0;
+  if (logoImgOk) {
+    const maxLogoW = Math.min(420, w - 48);
     const ar = logoImg.naturalWidth / logoImg.naturalHeight;
     let lw = maxLogoW;
     let lh = lw / ar;
-    const maxH = 32;
+    const maxH = 54;
     if (lh > maxH) {
       lh = maxH;
       lw = lh * ar;
     }
-    const lx = cxMid - lw * 0.5;
-    const ly = y0 + 6;
-    ctx.drawImage(logoImg, lx, ly, lw, lh);
-    scaleBlockTop = ly + lh + 8;
-  }
-
-  const scaleT = Math.max(
-    0,
-    Math.min(
-      1,
-      (contentScale - SCENE_MANIP_SCALE_MIN) / (SCENE_MANIP_SCALE_MAX - SCENE_MANIP_SCALE_MIN),
-    ),
-  );
-  const barW = Math.min(colW - 20, 400);
-  const barH = 12;
-  const barX = cxMid - barW * 0.5;
-
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.font = '700 12px system-ui, sans-serif';
-  ctx.fillStyle = "rgba(160, 195, 255, 0.95)";
-  ctx.fillText("WORLD SCALE", cxMid, scaleBlockTop);
-  ctx.font = '700 34px ui-monospace, "SF Mono", Menlo, monospace';
-  ctx.fillStyle = "rgba(235, 250, 255, 0.99)";
-  ctx.fillText(`${contentScale.toFixed(2)}×`, cxMid, scaleBlockTop + 16);
-  const barY = scaleBlockTop + 58;
-  ctx.fillStyle = "rgba(32, 44, 62, 0.98)";
-  ctx.beginPath();
-  ctx.roundRect(barX, barY, barW, barH, 6);
-  ctx.fill();
-  const fillW = Math.max(barW * scaleT, scaleT > 0 ? 3 : 0);
-  if (fillW > 0) {
+    const lx = cx - lw * 0.5;
+    const ly = 22 + (1 - logoPhase) * 28;
     ctx.save();
-    ctx.beginPath();
-    ctx.roundRect(barX, barY, fillW, barH, 6);
-    ctx.clip();
-    const gBar = ctx.createLinearGradient(barX, barY, barX + barW, barY);
-    gBar.addColorStop(0, "rgba(55, 165, 255, 0.98)");
-    gBar.addColorStop(0.55, "rgba(120, 235, 255, 0.95)");
-    gBar.addColorStop(1, "rgba(200, 255, 255, 0.92)");
-    ctx.fillStyle = gBar;
-    ctx.fillRect(barX, barY, fillW, barH);
+    ctx.globalAlpha = logoPhase;
+    ctx.drawImage(logoImg, lx, ly, lw, lh);
     ctx.restore();
   }
-  ctx.textBaseline = "middle";
-  ctx.font = '600 16px system-ui, sans-serif';
-  ctx.fillStyle = "rgba(200, 215, 245, 0.92)";
-  ctx.fillText(`Yaw ${yawDeg.toFixed(1)}°`, cxMid, barY + barH + 18);
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
 
-  if (roomDisp) {
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
-    const rx = w - margin - 22;
-    ctx.font = '600 11px system-ui, sans-serif';
-    ctx.fillStyle = "rgba(160, 185, 220, 0.75)";
-    ctx.fillText("ROOM", rx, h / 2 - 22);
-    ctx.font = '700 44px ui-monospace, "SF Mono", Menlo, monospace';
-    ctx.fillStyle = "rgba(200, 225, 255, 0.98)";
-    ctx.fillText(roomDisp, rx, h / 2 + 14);
-  } else {
-    ctx.textAlign = "right";
-    ctx.font = '500 14px system-ui, sans-serif';
-    ctx.fillStyle = "rgba(140, 155, 180, 0.45)";
-    ctx.fillText("No room — use lobby", w - margin - 22, h / 2);
-  }
+  const pillW = 256 * 3;
+  const hPill12 = 82 * 3;
+  const hPill3 = 122 * 3;
+  const gapLogoToPill = 52;
+  const gapBetweenPills = 56;
+  /** Vertical-only stagger (no horizontal shift): alternating extra spacing along Y. */
+  const staggerV2 = 14;
+  const staggerV3 = 22;
+  const yPill1 = 22 + 54 + gapLogoToPill;
+  const yPill2 = yPill1 + hPill12 + gapBetweenPills + staggerV2;
+  const yPill3 = yPill2 + hPill12 + gapBetweenPills + staggerV3;
+  const pxAll = (w - pillW) * 0.5;
 
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
-  ctx.lineWidth = 1;
-  for (const sx of [leftDividerX, rightDividerX]) {
+  const drawStadiumPill = (px, py, pw, ph, phase) => {
+    const slide = (1 - phase) * 48;
+    const r = ph * 0.5;
+    const pyDraw = py + slide;
+    ctx.save();
+    ctx.globalAlpha = phase;
+    ctx.fillStyle = pillFill;
     ctx.beginPath();
-    ctx.moveTo(sx, y0 + 18);
-    ctx.lineTo(sx, y0 + bh - 18);
+    ctx.roundRect(px, pyDraw, pw, ph, r);
+    ctx.fill();
+    ctx.strokeStyle = pillBorder;
+    ctx.lineWidth = borderW;
+    ctx.beginPath();
+    ctx.roundRect(px, pyDraw, pw, ph, r);
     ctx.stroke();
-  }
+    ctx.restore();
+  };
+
+  const ph0 = hudPillEnterPhase(elapsed, 0);
+  const ph1 = hudPillEnterPhase(elapsed, 1);
+  const ph2 = hudPillEnterPhase(elapsed, 2);
+
+  drawStadiumPill(pxAll, yPill1, pillW, hPill12, ph0);
+  drawStadiumPill(pxAll, yPill2, pillW, hPill12, ph1);
+  drawStadiumPill(pxAll, yPill3, pillW, hPill3, ph2);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const slide0 = (1 - ph0) * 48;
+  const slide1 = (1 - ph1) * 48;
+  const slide2 = (1 - ph2) * 48;
+
+  const cxPill = pxAll + pillW * 0.5;
+
+  ctx.save();
+  ctx.globalAlpha = ph0;
+  ctx.font = "500 68px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = textMuted;
+  ctx.fillText(timeStr, cxPill, yPill1 + hPill12 * 0.5 + slide0);
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = ph1;
+  const roomLine = roomDisp ? `Room: ${roomDisp}` : "No room — lobby";
+  ctx.font = "400 68px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = textMuted;
+  ctx.fillText(roomLine, cxPill, yPill2 + hPill12 * 0.5 + slide1);
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = ph2;
+  ctx.font = "500 130px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = textMuted;
+  ctx.fillText(`${contentScale.toFixed(2)}×`, cxPill, yPill3 + hPill3 * 0.5 + slide2);
+  ctx.restore();
 
   tex.needsUpdate = true;
 }
@@ -2941,6 +3366,7 @@ function wireGridCellSlider() {
     persistGridLatticeDivisions();
     valEl.textContent = gridCellSize().toFixed(4);
     rebuildGrid3dVisuals();
+    forceWristHtmlTextureUpdate();
   });
 }
 
@@ -2985,6 +3411,7 @@ function wireStrokeWidthSlider() {
     );
     valEl.textContent = userStrokeWidthMax.toFixed(3);
     persistStrokeWidthMax();
+    forceWristHtmlTextureUpdate();
   });
 }
 
@@ -3158,6 +3585,13 @@ function shouldDeferSketcharSceneApply() {
   );
 }
 
+/** Remote scene transform smoothing: skip lerp while this client is grabbing the same root. */
+function sceneNetworkIsLocalAuthority(obj) {
+  if (grabMode === "none") return false;
+  if (grabbedGrabRoots.length > 0) return grabbedGrabRoots.includes(obj);
+  return grabbedMesh === obj;
+}
+
 function isDrawingOrSelecting() {
   if (!gamepad1) return false;
   return isDrawing || _eraserThisFrame;
@@ -3309,13 +3743,27 @@ function init() {
   updateRingGridSnapIndicatorSprites();
 
   renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
-  renderer.setPixelRatio(window.devicePixelRatio, 2);
+  setPresenceLabelRenderer(renderer);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(sizes.width, sizes.height);
   renderer.setAnimationLoop(animate);
   renderer.xr.enabled = true;
+  /** Last-resort stability: `?xrSafe=1` or `window.__SKETCH_XR_SAFE === true` drops depth-sensing and lowers framebuffer scale. */
+  let sketcharXrOptionalFeatures = ["unbounded", "hand-tracking", "depth-sensing"];
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get("xrSafe") === "1" || window.__SKETCH_XR_SAFE === true) {
+      sketcharXrOptionalFeatures = ["unbounded", "hand-tracking"];
+      if (typeof renderer.xr.setFramebufferScaleFactor === "function") {
+        renderer.xr.setFramebufferScaleFactor(0.85);
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
   document.body.appendChild(
     XRButton.createButton(renderer, {
-      optionalFeatures: ["unbounded", "hand-tracking", "depth-sensing"],
+      optionalFeatures: sketcharXrOptionalFeatures,
     }),
   );
   const xrEnterBtn = document.getElementById("XRButton");
@@ -3326,22 +3774,23 @@ function init() {
 
   renderer.xr.addEventListener("sessionstart", () => {
     if (typeof window !== "undefined") window.__sketcharXRDepthSensing = false;
-    setupSketcharWristXR();
-    setupPalmMenuXR();
+    try {
+      setupSketcharWristXR();
+      setupPalmMenuXR();
+    } catch (e) {
+      console.warn("[Sketchar] XR wrist/palm HTMLMesh setup failed", e);
+    }
   });
   renderer.xr.addEventListener("sessionend", () => {
     if (typeof window !== "undefined") window.__sketcharXRDepthSensing = false;
     teardownSketcharWristXR();
   });
 
-  const controllerModelFactory = new XRControllerModelFactory();
-
   controller1 = renderer.xr.getController(0);
   controller1.addEventListener("connected", onControllerConnected);
   controller1.addEventListener("selectstart", onSelectStart);
   controller1.addEventListener("selectend", onSelectEnd);
   controllerGrip1 = renderer.xr.getControllerGrip(0);
-  controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
   scene.add(controllerGrip1);
   scene.add(controller1);
 
@@ -3350,7 +3799,6 @@ function init() {
   controller2.addEventListener("selectstart", onSelectStart);
   controller2.addEventListener("selectend", onSelectEnd);
   controllerGrip2 = renderer.xr.getControllerGrip(1);
-  controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
   scene.add(controllerGrip2);
   scene.add(controller2);
 
@@ -3370,6 +3818,23 @@ function init() {
   xrWristUiControllers.push(controller1, controller2, controller3, controller4);
 
   initSketcharUI();
+  initWristUiHitDebugFromUrl();
+}
+
+/** URL `?debugWristHits=1` or `window.__SKETCH_DEBUG_WRIST_HITS === true` — outline wrist HTMLMesh hit targets in the rasterized panel. */
+function initWristUiHitDebugFromUrl() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const fromUrl =
+      q.get("debugWristHits") === "1" ||
+      q.get("debugWristHits") === "true" ||
+      q.get("debugWristHits") === "yes";
+    const fromGlobal =
+      typeof window !== "undefined" && window.__SKETCH_DEBUG_WRIST_HITS === true;
+    if (fromUrl || fromGlobal) {
+      document.body.classList.add("sketchar-debug-wrist-hits");
+    }
+  } catch (_) {}
 }
 
 window.addEventListener("resize", () => {
@@ -3398,12 +3863,21 @@ function rayDirFromIndexTipPose(pose) {
 
 function updateStrokeBoundingSphereFromDrawRange(mesh) {
   const geo = mesh.geometry;
+  if (!geo || !geo.attributes) return;
   const pos = geo.attributes.position;
   if (!pos) return;
+  const posCount = pos.count;
+  if (posCount <= 0) return;
   const dr = geo.drawRange;
-  const start = dr.start;
-  const count = dr.count;
-  if (count === 0) return;
+  const rawStart = dr ? dr.start : 0;
+  const start = Math.max(0, Math.min(rawStart, posCount));
+  let count = dr?.count;
+  if (!Number.isFinite(count)) {
+    count = posCount - start;
+  } else {
+    count = Math.min(count, posCount - start);
+  }
+  if (count <= 0) return;
   _pickV.fromBufferAttribute(pos, start);
   _pickMin.copy(_pickV);
   _pickMax.copy(_pickV);
@@ -3434,7 +3908,20 @@ function getStrokeGrabRoot(obj) {
   while (o.parent && o.parent.userData && o.parent.userData.isStrokeCluster) {
     o = o.parent;
   }
-  return o;
+  /* Prefer GLB wrapper group (tagged on the direct strokesGroup child) so grab uses one root. */
+  let p = o;
+  while (p && p !== strokesGroup) {
+    if (p.userData && p.userData.isGltfAsset && p.isGroup) {
+      return p;
+    }
+    p = p.parent;
+  }
+  /* Nested GLB meshes: walk up to the direct child of strokesGroup (matches viewer getMovableRoot). */
+  let walk = o;
+  while (walk.parent && walk.parent !== strokesGroup) {
+    walk = walk.parent;
+  }
+  return walk.parent === strokesGroup ? walk : o;
 }
 
 function sameGrabTarget(a, b) {
@@ -3759,7 +4246,9 @@ function updatePickStrokeDebug(frame, session) {
     return;
   }
   const refSpace = renderer.xr.getReferenceSpace();
-  if (!refSpace) return;
+  if (!refSpace) {
+    return;
+  }
   updatePickStrokeDebugGroups(frame, session, refSpace, pickStrokeDebugLeft, "left");
   updatePickStrokeDebugGroups(frame, session, refSpace, pickStrokeDebugRight, "right");
   updatePickStrokeDebugStylus();
@@ -3929,7 +4418,19 @@ function deleteGrabbedStrokeRoot() {
   if (roots.length === 0) return;
   for (let ri = 0; ri < roots.length; ri++) {
     const root = roots[ri];
-    if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+    if (root.userData && root.userData.isGltfAsset && root.isGroup) {
+      recordSketcharDeletionForObject3D(root);
+      const u = typeof root.userData.gltfUrl === "string" ? root.userData.gltfUrl.trim() : "";
+      if (u) {
+        const rawUrl = import.meta.env.VITE_EXPORT_GLB_URL;
+        const rawTok = import.meta.env.VITE_EXPORT_GLB_TOKEN;
+        const exportUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
+        const exportTok = typeof rawTok === "string" ? rawTok.trim() : "";
+        void deleteRoomGlbFromR2(u, { url: exportUrl, token: exportTok });
+      }
+      disposeSceneGeometrySubtree(root);
+      root.removeFromParent();
+    } else if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
       recordSketcharDeletionForObject3D(root);
       root.traverse((o) => {
         if (o.isMesh && o.geometry) o.geometry.dispose();
@@ -4056,13 +4557,20 @@ function canSceneManip() {
   return true;
 }
 
+function refreshSceneStrokesOnTwoHandEnd() {
+  refreshAllStrokesTubeGeometryForWorldWidth();
+  sceneTwoHandStrokeRefreshAtScale = sceneContentRoot.scale.x;
+}
+
 function releaseSceneManip() {
+  const wasTwo = sceneManipMode === "two";
   sceneManipMode = "none";
   sceneGrabL = null;
   sceneGrabR = null;
   sceneOneSrc = null;
   sceneTwoHandStylusSide = null;
   scenePrevStylusRearGrab = false;
+  if (wasTwo) refreshSceneStrokesOnTwoHandEnd();
 }
 
 function initSceneOneHandGrab(_frame, _refSpace, inputSource, anchor) {
@@ -4106,6 +4614,7 @@ function transitionSceneTwoToOne(slot, frame, refSpace) {
   sceneOneSrc = slot.inputSource;
   getThumbMiddleAnchorWorldInto(frame, refSpace, slot.hand, sm_oneAnchor0);
   sceneOnePos0.copy(sceneContentRoot.position);
+  refreshSceneStrokesOnTwoHandEnd();
 }
 
 function sceneTwoHandGrabFinishInit() {
@@ -4113,7 +4622,12 @@ function sceneTwoHandGrabFinishInit() {
   sm_thDist0 = Math.max(sm_thV0.length(), 0.02);
   sm_thMid0.copy(sm_thPL0).add(sm_thPR0).multiplyScalar(0.5);
   sceneContentRoot.updateMatrixWorld(true);
-  sm_box.setFromObject(strokesGroup);
+  try {
+    sm_box.setFromObject(strokesGroup);
+  } catch (e) {
+    console.warn("[scene manip] strokesGroup bounds failed", e);
+    sm_box.makeEmpty();
+  }
   if (sm_box.isEmpty()) {
     _meshWorld.set(0, 0, 0);
     sm_thO0.copy(_meshWorld).sub(sm_thMid0);
@@ -4126,6 +4640,9 @@ function sceneTwoHandGrabFinishInit() {
   }
   sm_thBaseScale = sceneContentRoot.scale.x;
   sceneContentRoot.getWorldQuaternion(sm_thQuat0);
+  sceneTwoHandStrokeRefreshAtScale = sceneContentRoot.scale.x;
+  sceneTwoHandSmoothInit = true;
+  sceneTwoHandScaleSmoothed = 1;
 }
 
 function initSceneTwoHandGrab(frame, refSpace, leftSrc, rightSrc) {
@@ -4166,26 +4683,45 @@ function initSceneTwoHandGrabWithStylus(frame, refSpace, handSrc, stylusSide) {
 function updateSceneTwoHandGrab(frame, refSpace) {
   if (sceneTwoHandStylusSide === null) {
     if (!sceneGrabL?.hand || !sceneGrabR?.hand) return;
-    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabL.hand, sm_thPL)) return;
-    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabR.hand, sm_thPR)) return;
+    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabL.hand, _smRawL)) return;
+    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabR.hand, _smRawR)) return;
   } else if (sceneTwoHandStylusSide === "right") {
     if (!sceneGrabL?.hand || !stylus) return;
-    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabL.hand, sm_thPL)) return;
-    sm_thPR.copy(stylus.position);
+    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabL.hand, _smRawL)) return;
+    _smRawR.copy(stylus.position);
   } else if (sceneTwoHandStylusSide === "left") {
     if (!sceneGrabR?.hand || !stylus) return;
-    sm_thPL.copy(stylus.position);
-    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabR.hand, sm_thPR)) return;
+    _smRawL.copy(stylus.position);
+    if (!getThumbMiddleAnchorWorldInto(frame, refSpace, sceneGrabR.hand, _smRawR)) return;
   } else {
     return;
+  }
+
+  if (sceneTwoHandSmoothInit) {
+    sm_thPL.copy(_smRawL);
+    sm_thPR.copy(_smRawR);
+  } else {
+    sm_thPL.lerp(_smRawL, SCENE_TWO_HAND_HAND_SMOOTH);
+    sm_thPR.lerp(_smRawR, SCENE_TWO_HAND_HAND_SMOOTH);
   }
 
   sm_thV.copy(sm_thPR).sub(sm_thPL);
   const dist = sm_thV.length();
   if (dist < 1e-5 || sm_thDist0 < 1e-5) return;
 
-  let s = dist / sm_thDist0;
-  s = Math.min(SCENE_MANIP_SCALE_MAX, Math.max(SCENE_MANIP_SCALE_MIN, s));
+  let sRaw = dist / sm_thDist0;
+  sRaw = Math.min(SCENE_MANIP_SCALE_MAX, Math.max(SCENE_MANIP_SCALE_MIN, sRaw));
+  if (sceneTwoHandSmoothInit) {
+    sceneTwoHandScaleSmoothed = sRaw;
+  } else {
+    sceneTwoHandScaleSmoothed = THREE.MathUtils.lerp(
+      sceneTwoHandScaleSmoothed,
+      sRaw,
+      SCENE_TWO_HAND_SCALE_SMOOTH,
+    );
+  }
+  const s = sceneTwoHandScaleSmoothed;
+  if (sceneTwoHandSmoothInit) sceneTwoHandSmoothInit = false;
 
   sm_thV0n.copy(sm_thV0).normalize();
   sm_thVn.copy(sm_thV).normalize();
@@ -4225,7 +4761,6 @@ function updateSceneTwoHandGrab(frame, refSpace) {
   _meshWorld.add(_snapDeltaWorld);
   sceneContentRoot.position.copy(_meshWorld);
   if (sceneContentRoot.parent) sceneContentRoot.parent.worldToLocal(sceneContentRoot.position);
-  refreshAllStrokesTubeGeometryForWorldWidth();
 }
 
 function handleSceneManip(frame) {
@@ -4687,8 +5222,26 @@ function transitionTwoHandToStylusOne(frame, refSpace) {
 }
 
 function ensureMeshCenterLocal(mesh) {
+  if (!mesh?.userData) return new THREE.Vector3(0, 0, 0);
   if (mesh.userData.centerLocal) return mesh.userData.centerLocal;
-  if (mesh.isGroup && mesh.userData.isStrokeCluster) {
+  if (mesh.userData.isGltfAsset && mesh.isGroup) {
+    mesh.updateMatrixWorld(true);
+    try {
+      _gltfGrabBounds.setFromObject(mesh);
+      if (_gltfGrabBounds.isEmpty()) {
+        mesh.userData.centerLocal = new THREE.Vector3(0, 0, 0);
+      } else {
+        _gltfGrabBounds.getCenter(_centerLocal);
+        mesh.worldToLocal(_centerLocal);
+        mesh.userData.centerLocal = _centerLocal.clone();
+      }
+    } catch (e) {
+      console.warn("[gltf] ensureMeshCenterLocal bounds failed", e);
+      mesh.userData.centerLocal = new THREE.Vector3(0, 0, 0);
+    }
+    return mesh.userData.centerLocal;
+  }
+  if (mesh.isGroup && mesh.userData && mesh.userData.isStrokeCluster) {
     _centerLocal.set(0, 0, 0);
     let n = 0;
     for (const ch of mesh.children) {
@@ -4717,7 +5270,7 @@ function ensureMeshCenterLocal(mesh) {
     return mesh.userData.centerLocal;
   }
   updateStrokeBoundingSphereFromDrawRange(mesh);
-  if (mesh.geometry.boundingSphere) {
+  if (mesh.geometry && mesh.geometry.boundingSphere) {
     mesh.userData.centerLocal = mesh.geometry.boundingSphere.center.clone();
     return mesh.userData.centerLocal;
   }
@@ -5099,6 +5652,7 @@ function updateStrokeUndoRedoButtons() {
   const r = document.getElementById("sketchar-redo");
   if (u) u.disabled = strokeUndoStack.length === 0;
   if (r) r.disabled = strokeRedoStack.length === 0;
+  forceWristHtmlTextureUpdate();
 }
 
 function undoLastStroke() {
@@ -5618,9 +6172,9 @@ function handleHandGrab(frame) {
 
   for (const hs of starters) {
     rayDirFromIndexTipPose(hs.indexPose);
+    jointPositionFromPose(hs.indexPose, _indexTipPos);
     const roots = pickStrokeRoots(hs.indexPos, _rayDir);
     if (roots.length === 0) continue;
-    jointPositionFromPose(hs.indexPose, _indexTipPos);
     beginOneHandGrabWithRoots(roots, _indexTipPos, hs.inputSource, false);
     break;
   }
@@ -5713,6 +6267,7 @@ function animate(time, frame) {
     /* Scene/world manip must run before hand grab: rear+stylus would otherwise pick a stroke and block canSceneManip(). */
     handleSceneManip(frame);
     handleHandGrab(frame);
+    maybePushSketcharDuringGrabTransform();
     updateLeftHandStylusGrabFingerAffordances();
     handleStylusGrabAuxPinches(frame);
   }
@@ -5759,7 +6314,8 @@ function animate(time, frame) {
   }
   prevGrabModeForSketchar = grabMode;
 
-  updateHudFollow(time);
+  updateHudFollow(time, frame);
+  tickHudAppearState(performance.now());
   updateHudClock();
 
   if (grid3dGroupRef) {
@@ -5781,7 +6337,7 @@ function animate(time, frame) {
           _questHeadWorld.set(p.x, p.y, p.z);
           strokesGroup.worldToLocal(_questHeadLocal.copy(_questHeadWorld));
           const o = pose.transform.orientation;
-          /** @type {{ deviceId: string, label: string, mode: "xr_head", x: number, y: number, z: number, qx?: number, qy?: number, qz?: number, qw?: number, sx?: number, sy?: number, sz?: number, sqx?: number, sqy?: number, sqz?: number, sqw?: number }} */
+          /** @type {{ deviceId: string, label: string, mode: "xr_head", x: number, y: number, z: number, qx?: number, qy?: number, qz?: number, qw?: number, sx?: number, sy?: number, sz?: number, sqx?: number, sqy?: number, sqz?: number, sqw?: number, lf?: number[], rf?: number[] }} */
           const payload = {
             deviceId: sketcharDeviceId,
             label: defaultPresenceLabel(),
@@ -5817,6 +6373,39 @@ function animate(time, frame) {
             payload.sqz = _stylusLocalQuat.z;
             payload.sqw = _stylusLocalQuat.w;
           }
+
+          const session = renderer.xr.getSession();
+          if (session) {
+            for (const inputSource of session.inputSources) {
+              if (!inputSource.hand) continue;
+              if (inputSource.handedness !== "left" && inputSource.handedness !== "right") continue;
+              const chunk = [];
+              let ok = true;
+              for (let fi = 0; fi < PRESENCE_STREAM_FINGER_JOINTS.length; fi++) {
+                const joint = inputSource.hand.get(PRESENCE_STREAM_FINGER_JOINTS[fi]);
+                if (!joint) {
+                  ok = false;
+                  break;
+                }
+                const tipPose = frame.getPose(joint, refSpace);
+                if (!tipPose) {
+                  ok = false;
+                  break;
+                }
+                const tp = tipPose.transform.position;
+                _tipWorld.set(tp.x, tp.y, tp.z);
+                strokesGroup.worldToLocal(_tipLocal.copy(_tipWorld));
+                chunk.push(_tipLocal.x, _tipLocal.y, _tipLocal.z);
+              }
+              if (!ok || chunk.length !== 15) continue;
+              if (inputSource.handedness === "left") {
+                payload.lf = chunk;
+              } else {
+                payload.rf = chunk;
+              }
+            }
+          }
+
           sketcharRoomRealtime.sendPresence(payload);
         }
       }
@@ -5830,6 +6419,16 @@ function animate(time, frame) {
     smoothPresencePeers(sketcharRemotePeers, dt);
     remotePresenceGroup.visible = sketcharShowOthers;
     pruneStalePresencePeers(sketcharRemotePeers, now, 6000);
+  }
+
+  {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - lastSceneNetworkSmoothMs) / 1000);
+    lastSceneNetworkSmoothMs = now;
+    smoothSceneNetworkTransforms(strokesGroup, dt, {
+      lambda: 14,
+      isLocalAuthority: sceneNetworkIsLocalAuthority,
+    });
   }
 
   renderer.render(scene, camera);

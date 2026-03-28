@@ -8,7 +8,20 @@
     <link rel="stylesheet" href="./viewer.css" />
 </head>
 <body>
-    <canvas id="c"></canvas>
+    <div class="viewer-canvas-wrap">
+        <canvas id="c"></canvas>
+        <div
+            id="viewer-glb-drop-hint"
+            class="viewer-glb-drop-hint"
+            hidden
+            aria-hidden="true"
+        >
+            <div class="viewer-glb-drop-hint-inner">
+                <span class="viewer-glb-drop-icon" aria-hidden="true"></span>
+                <span class="viewer-glb-drop-label">Drop GLB to add to room</span>
+            </div>
+        </div>
+    </div>
     <div id="selection-rect-overlay" class="selection-rect-overlay" hidden aria-hidden="true"></div>
     <div
         id="multi-select-toolbar"
@@ -102,7 +115,7 @@
                 aria-hidden="true"
             >
                 <label class="quest-follow-row"
-                    >FOV
+                    >FOV (preview only)
                     <input
                         type="range"
                         id="quest-follow-fov"
@@ -110,7 +123,8 @@
                         max="110"
                         step="1"
                         value="75"
-                        aria-label="Follow mode field of view"
+                        aria-label="Follow mode field of view for this preview only"
+                        title="Adjusts this browser preview only. The Quest headset uses its own optics; this does not change Quest FOV."
                     />
                     <span id="quest-follow-fov-val" class="quest-follow-val">75</span></label>
             </div>
@@ -120,7 +134,7 @@
                 class="axis-fab"
                 aria-label="Follow Quest view"
                 aria-pressed="false"
-                title="Match the Quest headset view (3D, not video). While on: adjust FOV; WASD, drag orbit, or wheel exits follow."
+                title="Match the Quest headset view in this preview (3D, not video). FOV slider applies here only. WASD, drag orbit, or wheel exits follow."
             >
                 <span class="quest-follow-fab-icon" aria-hidden="true"></span>
             </button>

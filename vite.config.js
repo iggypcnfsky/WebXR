@@ -15,6 +15,13 @@ export default {
     host: true, // Open to local network and display URL
     open: !("SANDBOX_URL" in process.env || "CODESANDBOX_HOST" in process.env), // Open if it's not a CodeSandbox
     https: true,
+    /** Next upload API: `npm run upload-api:dev` (port 3001); use VITE_EXPORT_GLB_URL=/api/export-glb */
+    proxy: {
+      "/api/export-glb": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+      },
+    },
   },
   build: {
     outDir: "../dist", // Output in the dist/ folder
