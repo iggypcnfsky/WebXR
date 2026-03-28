@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
     <title>Sketchar viewer</title>
+    <link rel="icon" href="/sketchar-logo.svg?v=1" type="image/svg+xml" />
     <link rel="stylesheet" href="./viewer.css" />
 </head>
 <body>
@@ -87,11 +88,56 @@
                 <span class="auto-orbit-fab-icon" aria-hidden="true"></span>
             </button>
         </div>
+        <div id="quest-follow-wrap" class="quest-follow-wrap">
+            <select
+                id="quest-follow-select"
+                class="quest-follow-select"
+                aria-label="Which Quest to follow"
+                hidden
+            ></select>
+            <div
+                id="quest-follow-controls"
+                class="quest-follow-controls"
+                hidden
+                aria-hidden="true"
+            >
+                <label class="quest-follow-row"
+                    >FOV
+                    <input
+                        type="range"
+                        id="quest-follow-fov"
+                        min="40"
+                        max="110"
+                        step="1"
+                        value="75"
+                        aria-label="Follow mode field of view"
+                    />
+                    <span id="quest-follow-fov-val" class="quest-follow-val">75</span></label>
+            </div>
+            <button
+                type="button"
+                id="btn-quest-follow"
+                class="axis-fab"
+                aria-label="Follow Quest view"
+                aria-pressed="false"
+                title="Match the Quest headset view (3D, not video). While on: adjust FOV; WASD, drag orbit, or wheel exits follow."
+            >
+                <span class="quest-follow-fab-icon" aria-hidden="true"></span>
+            </button>
+        </div>
     </div>
     <div id="menu-backdrop" class="menu-backdrop" hidden aria-hidden="true"></div>
     <div id="app-chrome" class="app-chrome">
         <header class="app-top-bar">
-            <h1 class="app-brand">Sketchar</h1>
+            <h1 class="app-brand">
+                <img
+                    class="viewer-logo"
+                    src="/sketchar-logo.svg?v=1"
+                    width="150"
+                    height="13"
+                    alt="Sketchar"
+                />
+            </h1>
             <div class="settings-menu">
                 <button
                     type="button"

@@ -14,24 +14,35 @@ import {
   Vector3,
 } from "three";
 
-/** sides=10 × 6 verts per side per segment in upstream stroke(). */
-const VERTS_PER_SEGMENT = 60;
+/** sides × 6 verts per side per segment in stroke(). */
+const VERTS_PER_SEGMENT_TUBE = 60;
+const VERTS_PER_SEGMENT_SQUARE = 24;
 
 /**
  * Conservative max vertex count for a polyline with `pointCount` samples.
  * @param {number} pointCount
+ * @param {"tube"|"square"} [profile]
  */
-export function computeTubePainterMaxVertices(pointCount) {
+export function computeStrokePainterMaxVertices(pointCount, profile = "tube") {
   const n = Math.max(0, pointCount | 0);
   if (n < 2) return 64;
   const segments = n - 1;
-  return Math.min(1_000_000, segments * VERTS_PER_SEGMENT + 256);
+  const vps =
+    profile === "square" ? VERTS_PER_SEGMENT_SQUARE : VERTS_PER_SEGMENT_TUBE;
+  return Math.min(1_000_000, segments * vps + 256);
+}
+
+/** @param {number} pointCount */
+export function computeTubePainterMaxVertices(pointCount) {
+  return computeStrokePainterMaxVertices(pointCount, "tube");
 }
 
 /**
  * @param {number} maxVertices Upper bound on geometry.drawRange.count after all segments.
+ * @param {{ profile?: "tube"|"square" }} [options] Square profile = constant square cross-section (grid strokes).
  */
-export function createTubePainterSized(maxVertices) {
+export function createTubePainterSized(maxVertices, options = {}) {
+  const profile = options.profile === "square" ? "square" : "tube";
   const v = Math.max(64, Math.min(1_000_000, maxVertices | 0));
   const BUFFER_SIZE = v * 3;
 
@@ -59,10 +70,21 @@ export function createTubePainterSized(maxVertices) {
 
   function getPoints(size) {
     const PI2 = Math.PI * 2;
-    const sides = 10;
     const array = [];
     const radius = 0.01 * size;
 
+    if (profile === "square") {
+      const r = radius;
+      array.push(
+        new Vector3(r, r, 0),
+        new Vector3(-r, r, 0),
+        new Vector3(-r, -r, 0),
+        new Vector3(r, -r, 0),
+      );
+      return array;
+    }
+
+    const sides = 10;
     for (let i = 0; i < sides; i++) {
       const angle = (i / sides) * PI2;
       array.push(

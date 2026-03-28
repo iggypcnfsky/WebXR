@@ -29,9 +29,72 @@ body {
 .stylus-fab-wrap,
 .select-mode-wrap,
 .axis-view-wrap,
-.auto-orbit-wrap {
+.auto-orbit-wrap,
+.quest-follow-wrap {
   position: relative;
   pointer-events: auto;
+}
+.quest-follow-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+.quest-follow-select {
+  max-width: 160px;
+  padding: 6px 8px;
+  font-size: 13px;
+  color: #e8f0ff;
+  background: rgba(30, 38, 55, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.quest-follow-fab-icon {
+  display: flex;
+  width: 26px;
+  height: 26px;
+}
+.quest-follow-fab-icon svg {
+  width: 100%;
+  height: 100%;
+}
+.quest-follow-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 8px 10px;
+  max-width: min(220px, 70vw);
+  background: rgba(22, 28, 40, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 11px;
+  color: #c8d4e8;
+}
+/* Author `display: flex` must not override native [hidden]; match .stylus-fab-wrap[hidden]. */
+.quest-follow-controls[hidden] {
+  display: none !important;
+}
+.quest-follow-row {
+  display: grid;
+  grid-template-columns: 36px 1fr 40px;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  cursor: default;
+}
+.quest-follow-row input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  accent-color: #6b9ae8;
+}
+.quest-follow-val {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #e8f0ff;
 }
 .stylus-fab-wrap {
   z-index: 0;
@@ -229,11 +292,17 @@ body {
 
 .app-brand {
   margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-  color: #a8c8ff;
-  line-height: 1.2;
+  line-height: 0;
   pointer-events: none;
+}
+
+.viewer-logo {
+  display: block;
+  width: min(154px, calc(100vw - 120px));
+  height: auto;
+  max-height: 20px;
+  object-fit: contain;
+  object-position: left center;
 }
 
 .settings-menu {

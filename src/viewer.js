@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import Eye from "lucide/dist/esm/icons/eye.js";
 import Menu from "lucide/dist/esm/icons/menu.js";
 import Pen from "lucide/dist/esm/icons/pen.js";
 import Rotate3d from "lucide/dist/esm/icons/rotate-3d.js";
@@ -10,22 +11,28 @@ import {
   applyScenePayloadIncremental,
   disposeSceneGeometrySubtree,
   matrix4FromArray,
-  mergeScenePayloads,
+  mergeScenePayloadsForPush,
   mergeScenePayloadsForViewerPoll,
-  mergeScenePayloadsWithRemovals,
   nodeIdFromPayload,
   sceneNodeIdFromObject3D,
   serializeStrokesGroup,
+  snapshotTimestampIsStrictlyOlder,
   strokeWidthFromPressure,
 } from "./shared/sceneCodec.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
 import {
   defaultPresenceLabel,
+  disposePresencePeerSubtree,
   getOrCreateDeviceId,
   getShowOthersPreference,
+  preloadPresenceHeadModel,
+  preloadPresenceStylusModel,
   pruneStalePresencePeers,
+  refreshPresenceVisualsFromStoredPayload,
   setPresenceTargetsFromPayload,
   setShowOthersPreference,
+  SKETCHAR_PRESENCE_HEAD_GLB_URL,
+  SKETCHAR_PRESENCE_STYLUS_GLB_URL,
   smoothPresencePeers,
 } from "./shared/sketcharPresence.js";
 import {
@@ -36,6 +43,11 @@ import {
   upsertPin,
   upsertSnapshot,
 } from "./shared/sketcharSupabase.js";
+import {
+  DEFAULT_STROKE_COLOR_HEX,
+  getStrokeMaterialForHex,
+  voxelMaterial,
+} from "./shared/strokeMaterial.js";
 
 /**
  * Lucide ESM icon → SVG element (viewBox 24×24).
@@ -96,6 +108,59 @@ const elAutoOrbitWrap = document.getElementById("auto-orbit-wrap");
 const btnAutoOrbit = document.getElementById("btn-auto-orbit");
 const elAutoOrbitFabIcon = document.querySelector("#btn-auto-orbit .auto-orbit-fab-icon");
 if (elAutoOrbitFabIcon) elAutoOrbitFabIcon.appendChild(lucideIconToSvg(Rotate3d));
+
+const elQuestFollowWrap = document.getElementById("quest-follow-wrap");
+const btnQuestFollow = document.getElementById("btn-quest-follow");
+const elQuestFollowSelect = document.getElementById("quest-follow-select");
+const elQuestFollowFabIcon = document.querySelector("#btn-quest-follow .quest-follow-fab-icon");
+if (elQuestFollowFabIcon) elQuestFollowFabIcon.appendChild(lucideIconToSvg(Eye));
+const elQuestFollowControls = document.getElementById("quest-follow-controls");
+const elQuestFollowFov = document.getElementById("quest-follow-fov");
+const elQuestFollowFovVal = document.getElementById("quest-follow-fov-val");
+
+const FOLLOW_FOV_STORAGE_KEY = "sketchar_follow_fov";
+const DEFAULT_VIEWER_FOV = 50;
+const FOLLOW_FOV_MIN = 40;
+const FOLLOW_FOV_MAX = 110;
+const DEFAULT_FOLLOW_FOV = 75;
+const DEFAULT_FOLLOW_BACK_M = 0.08;
+const DEFAULT_FOLLOW_DOWN_M = 0.05;
+
+function updateQuestFollowControlLabels() {
+  if (elQuestFollowFovVal && elQuestFollowFov) {
+    elQuestFollowFovVal.textContent = String(Math.round(Number(elQuestFollowFov.value) || DEFAULT_FOLLOW_FOV));
+  }
+}
+
+function syncFollowSlidersFromStorage() {
+  try {
+    const f = localStorage.getItem(FOLLOW_FOV_STORAGE_KEY);
+    if (f != null && elQuestFollowFov) {
+      const n = Number(f);
+      if (Number.isFinite(n)) {
+        elQuestFollowFov.value = String(THREE.MathUtils.clamp(n, FOLLOW_FOV_MIN, FOLLOW_FOV_MAX));
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  updateQuestFollowControlLabels();
+}
+
+function persistFollowSliderValues() {
+  try {
+    if (elQuestFollowFov) localStorage.setItem(FOLLOW_FOV_STORAGE_KEY, elQuestFollowFov.value);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function applyFollowFovToCamera() {
+  const n = elQuestFollowFov ? Number(elQuestFollowFov.value) : DEFAULT_FOLLOW_FOV;
+  const fov = Number.isFinite(n) ? THREE.MathUtils.clamp(n, FOLLOW_FOV_MIN, FOLLOW_FOV_MAX) : DEFAULT_FOLLOW_FOV;
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+}
 
 const btnMenuToggle = document.getElementById("btn-menu-toggle");
 const elSettingsPanel = document.getElementById("settings-panel");
@@ -213,11 +278,6 @@ canvas.addEventListener(
   false,
 );
 
-const material = new THREE.MeshNormalMaterial({
-  flatShading: true,
-  side: THREE.DoubleSide,
-});
-
 const alignmentGroup = new THREE.Group();
 const contentGroup = new THREE.Group();
 alignmentGroup.add(contentGroup);
@@ -226,12 +286,87 @@ scene.add(alignmentGroup);
 const remotePresenceGroup = new THREE.Group();
 remotePresenceGroup.name = "remote-presence";
 remotePresenceGroup.renderOrder = 1000;
+remotePresenceGroup.userData.preserveInSceneApply = true;
 contentGroup.add(remotePresenceGroup);
+
+/** Sketch-origin floor grid — match Quest `ORIGIN_FLOOR_GRID_*` in script.js. */
+const GRID_SIZE = 12;
+const gridDivisions = 80;
+const VIEWER_GRID_COLOR1 = 0x4a5568;
+const VIEWER_GRID_COLOR2 = 0x2d3748;
+
+/** Same logical origin as Quest `sceneContentRoot` (0,0,0); `frameContentAtOrigin` offsets the group. */
+const ORIGIN_FLOOR_STORAGE_KEY = "mxink-origin-floor";
+let viewerOriginFloorVisible = true;
+try {
+  const raw = localStorage.getItem(ORIGIN_FLOOR_STORAGE_KEY);
+  if (raw === "0") viewerOriginFloorVisible = false;
+} catch (_) {
+  /* ignore */
+}
+
+const viewerOriginGizmoGroup = new THREE.Group();
+viewerOriginGizmoGroup.name = "viewer-origin-gizmo";
+viewerOriginGizmoGroup.userData.preserveInSceneApply = true;
+{
+  const axes = new THREE.AxesHelper(0.16);
+  axes.renderOrder = 10;
+  viewerOriginGizmoGroup.add(axes);
+  const originDot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.007, 10, 10),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  viewerOriginGizmoGroup.add(originDot);
+  const originFloorGrid = new THREE.GridHelper(
+    GRID_SIZE,
+    gridDivisions,
+    VIEWER_GRID_COLOR1,
+    VIEWER_GRID_COLOR2,
+  );
+  originFloorGrid.name = "viewer-origin-floor-grid";
+  originFloorGrid.renderOrder = -5;
+  originFloorGrid.visible = viewerOriginFloorVisible;
+  viewerOriginGizmoGroup.add(originFloorGrid);
+  viewerOriginGizmoGroup.userData.originFloorGrid = originFloorGrid;
+}
+viewerOriginGizmoGroup.traverse((o) => {
+  if (o.isMesh || o.isLineSegments) o.raycast = () => {};
+});
+contentGroup.add(viewerOriginGizmoGroup);
+
+try {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== ORIGIN_FLOOR_STORAGE_KEY) return;
+    const grid = viewerOriginGizmoGroup.userData.originFloorGrid;
+    if (grid) grid.visible = e.newValue !== "0";
+  });
+} catch (_) {
+  /* ignore */
+}
 /** @type {Map<string, THREE.Group>} */
 const viewerRemotePeers = new Map();
+void preloadPresenceHeadModel(SKETCHAR_PRESENCE_HEAD_GLB_URL)
+  .then(() => {
+    refreshPresenceVisualsFromStoredPayload(viewerRemotePeers);
+  })
+  .catch(() => {});
+void preloadPresenceStylusModel(SKETCHAR_PRESENCE_STYLUS_GLB_URL)
+  .then(() => {
+    refreshPresenceVisualsFromStoredPayload(viewerRemotePeers);
+  })
+  .catch(() => {});
 let viewerLastPresenceSmoothMs = performance.now();
 const viewerDeviceId = getOrCreateDeviceId();
 let viewerShowOthers = getShowOthersPreference();
+/** Match preview camera to a Quest head pose from presence (3D follow, not video). */
+let followQuestActive = false;
+/** @type {string | null} */
+let followQuestDeviceId = null;
+let lastQuestFollowSelectKey = "";
 /** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
 let viewerRoomRealtime = null;
 let lastViewerPresenceSendMs = 0;
@@ -241,21 +376,16 @@ const _vCamQuatW = new THREE.Quaternion();
 const _vParentInv = new THREE.Quaternion();
 const _vCamLocalPos = new THREE.Vector3();
 const _vCamLocalQuat = new THREE.Quaternion();
+/** WebXR viewer pose vs Three.js preview: extra **world** −Y (m) applied after world position. */
+const QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M = 0;
+/** Scratch: world-space Y adjust for xr_head presence targets. */
+const _questHeadPosWorldAdj = new THREE.Vector3();
+/** Head local space: +Z behind camera, −Y down — offset preview to match Quest framing. */
+const _followOffsetLocal = new THREE.Vector3();
+/** Scratch: camera local +Y in world space (preserves head roll / ear-to-shoulder tilt). */
+const _followCamUpWorld = new THREE.Vector3();
 const _presenceSizeScratch = new THREE.Vector3();
 const _presenceStrokeBounds = new THREE.Box3();
-
-/** Ground plane grid at y=0 — sketch is framed so its bottom sits on the floor; origin is 0,0,0. */
-const GRID_SIZE = 8;
-const gridDivisions = isMobileViewer ? 20 : 40;
-const gridHelper = new THREE.GridHelper(
-  GRID_SIZE,
-  gridDivisions,
-  0x4a5568,
-  0x2d3748,
-);
-gridHelper.position.y = 0;
-gridHelper.name = "viewer-ground-grid";
-scene.add(gridHelper);
 
 scene.add(new THREE.HemisphereLight(0x8899aa, 0x445566, 2.5));
 const dl = new THREE.DirectionalLight(0xffffff, 1.2);
@@ -311,6 +441,8 @@ let viewerStrokePosting = false;
 let viewerSnapshotPostChain = Promise.resolve();
 /** Stroke syncIds from this viewer not yet confirmed by a successful POST (see mergeScenePayloadsForViewerPoll). */
 const viewerPendingSyncIds = new Set();
+/** Local deletes before server confirms (same tombstone idea as Quest). */
+const viewerDeletedSyncIds = new Set();
 const _orbitBox = new THREE.Box3();
 /** Preview strokes (viewer only): shorter segments + interpolation between sparse pointer events for smoother tubes. */
 const VIEWER_STROKE_MIN_SEGMENT = 0.0024;
@@ -326,7 +458,7 @@ transformControl.setSpace("world");
 transformControl.setSize(0.85);
 transformControl.addEventListener("dragging-changed", (event) => {
   /* While dragging the gizmo, disable OrbitControls entirely so touch/mouse goes to TransformControls. */
-  controls.enabled = !event.value;
+  controls.enabled = !event.value && !followQuestActive;
 });
 scene.add(transformControl);
 
@@ -582,7 +714,7 @@ function detachTransformClean() {
       parent.remove(attached);
     }
   }
-  controls.target.set(0, 0, 0);
+  setControlsTargetToSketchWorldOrigin();
   transformControl.visible = false;
   syncOrbitWithGizmo();
 }
@@ -618,6 +750,8 @@ const arRig = new THREE.Group();
 arRig.position.set(0, 0, -1.35);
 
 let lastSnapshotKey = "";
+/** Monotonic guard for snapshot applies (same semantics as Quest `lastSketcharRemoteSeen`). */
+let lastViewerSnapshotAppliedAt = null;
 let pollBusy = false;
 /** @type {string} */
 let viewerRoomId = "";
@@ -679,14 +813,17 @@ function getSnapshotChangeKey(data) {
       alMat = m.elements.join(",");
     else alMat = JSON.stringify(m);
   }
+  const contentFp = snapshotContentFingerprint(data.snapshot);
   if (snapAtStr !== "") {
-    return `${snapAtStr}|${alTime}|${alMat}`;
+    /* Include content fingerprint: `updated_at` can match across two writes (same ms / resolution),
+     * so timestamp-only keys skip applies and new objects (e.g. Quest duplicates) never reach the preview. */
+    return `${snapAtStr}|${alTime}|${alMat}|${contentFp}`;
   }
   const alKey =
     al == null
       ? "noal"
       : `${alTime}|${alMat.length}|${alMat.slice(0, 64)}`;
-  return `legacy|${snapshotContentFingerprint(data.snapshot)}|${alKey}`;
+  return `legacy|${contentFp}|${alKey}`;
 }
 
 function getViewMode() {
@@ -805,6 +942,7 @@ function applyAxisView(axis) {
 function toggleAxisView(axis) {
   if (getViewMode() !== "2d" && getViewMode() !== "align") return;
   if (renderer.xr.isPresenting) return;
+  if (followQuestActive) setFollowQuestActive(false);
   if (axisViewActive === axis) {
     exitAxisViewIfNeeded();
     return;
@@ -822,17 +960,21 @@ function syncAxisViewFabVisibility() {
     elAutoOrbitWrap.hidden = hide;
     if (hide) disableAutoOrbit();
   }
+  if (elQuestFollowWrap) {
+    elQuestFollowWrap.hidden = hide;
+    if (hide) setFollowQuestActive(false);
+  }
 }
 
 /**
  * Place sketch so world origin is meaningful: center XZ at 0, bottom of bounds on y=0 (floor grid).
- * Excludes `remotePresenceGroup` so orbit framing targets strokes only (presence is not part of the sketch).
+ * Excludes presence and the origin gizmo so framing targets strokes only.
  */
 function frameContentAtOrigin() {
   contentGroup.updateMatrixWorld(true);
   const box = new THREE.Box3();
   for (const ch of contentGroup.children) {
-    if (ch === remotePresenceGroup) continue;
+    if (ch === remotePresenceGroup || ch === viewerOriginGizmoGroup) continue;
     box.expandByObject(ch);
   }
   if (box.isEmpty()) {
@@ -845,6 +987,25 @@ function frameContentAtOrigin() {
   contentGroup.updateMatrixWorld(true);
 }
 
+const _sketchOriginWorld = new THREE.Vector3();
+const _orbitCamOffset = new THREE.Vector3();
+
+/** Orbit pivot: sketch (0,0,0) in content space, world position after framing + alignment. */
+function setControlsTargetToSketchWorldOrigin() {
+  contentGroup.updateMatrixWorld(true);
+  _sketchOriginWorld.set(0, 0, 0);
+  contentGroup.localToWorld(_sketchOriginWorld);
+  controls.target.copy(_sketchOriginWorld);
+}
+
+/** First snapshot load: pivot on sketch origin and preserve camera offset from previous target. */
+function syncOrbitTargetToSketchOrigin() {
+  _orbitCamOffset.copy(camera.position).sub(controls.target);
+  setControlsTargetToSketchWorldOrigin();
+  camera.position.copy(controls.target).add(_orbitCamOffset);
+  controls.update();
+}
+
 /**
  * Remote head/cone primitives are ~0.1 m; orbit cameras sit several meters away, so markers read as invisible.
  * Scale presence to the stroke bounds (excluding presence) so peers stay visible in preview.
@@ -852,7 +1013,7 @@ function frameContentAtOrigin() {
 function updateRemotePresenceViewerScale() {
   _presenceStrokeBounds.makeEmpty();
   for (const ch of contentGroup.children) {
-    if (ch === remotePresenceGroup) continue;
+    if (ch === remotePresenceGroup || ch === viewerOriginGizmoGroup) continue;
     _presenceStrokeBounds.expandByObject(ch);
   }
   if (_presenceStrokeBounds.isEmpty()) {
@@ -865,7 +1026,10 @@ function updateRemotePresenceViewerScale() {
   remotePresenceGroup.scale.setScalar(s);
 }
 
-/** Draw-through strokes so orange/blue markers are not lost behind thick tubes on preview. */
+/**
+ * Presence markers: draw-through (no depth test) so cones/sprites stay visible behind strokes.
+ * Head/stylus GLB: depth test on so shared materials occlude each other correctly.
+ */
 function applyViewerPresenceRenderHints() {
   remotePresenceGroup.traverse((o) => {
     if (o instanceof THREE.Mesh || o instanceof THREE.Sprite) {
@@ -879,8 +1043,20 @@ function applyViewerPresenceRenderHints() {
       : [];
     for (const m of mats) {
       if (m) {
-        m.depthTest = false;
-        m.transparent = true;
+        if (m.userData.presenceHeadOpaque) {
+          m.depthTest = true;
+          m.depthWrite = true;
+          m.opacity = 1;
+          m.transparent = false;
+          m.premultipliedAlpha = false;
+          m.blending = THREE.NormalBlending;
+        } else if (o instanceof THREE.Sprite) {
+          m.depthTest = false;
+          m.transparent = true;
+        } else {
+          m.depthTest = false;
+          if (m.opacity !== undefined && m.opacity < 1) m.transparent = true;
+        }
         m.needsUpdate = true;
       }
     }
@@ -953,7 +1129,7 @@ function collectObjectsInScreenRect(sel) {
   const out = [];
   const canvasRect = canvas.getBoundingClientRect();
   for (const ch of contentGroup.children) {
-    if (ch === remotePresenceGroup) continue;
+    if (ch === remotePresenceGroup || ch === viewerOriginGizmoGroup) continue;
     const bounds = getScreenBoundsForContentRoot(ch, canvasRect);
     if (bounds && rectsOverlap2D(sel, bounds)) out.push(ch);
   }
@@ -1018,20 +1194,19 @@ function setMultiSelection(roots) {
 function clearViewerRemotePeers() {
   for (const g of viewerRemotePeers.values()) {
     remotePresenceGroup.remove(g);
-    g.traverse((o) => {
-      if (o.geometry) o.geometry.dispose();
-      if (o.material) {
-        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
-        else o.material.dispose();
-      }
-    });
+    disposePresencePeerSubtree(g);
   }
   viewerRemotePeers.clear();
+  lastQuestFollowSelectKey = "";
+  if (elQuestFollowSelect) {
+    elQuestFollowSelect.innerHTML = "";
+    elQuestFollowSelect.hidden = true;
+  }
+  followQuestDeviceId = null;
 }
 
 function handleViewerRemotePresence(p) {
   if (!p || p.deviceId === viewerDeviceId) return;
-  if (!viewerShowOthers) return;
   let g = viewerRemotePeers.get(p.deviceId);
   if (!g) {
     g = new THREE.Group();
@@ -1040,7 +1215,162 @@ function handleViewerRemotePresence(p) {
     viewerRemotePeers.set(p.deviceId, g);
   }
   g.userData.lastMs = performance.now();
+  g.userData.presenceLabel = p.label;
   setPresenceTargetsFromPayload(p, g);
+  if (
+    p.mode === "xr_head" &&
+    g.userData.targetPos &&
+    QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M !== 0
+  ) {
+    contentGroup.updateMatrixWorld(true);
+    _questHeadPosWorldAdj.copy(g.userData.targetPos);
+    contentGroup.localToWorld(_questHeadPosWorldAdj);
+    _questHeadPosWorldAdj.y += QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M;
+    contentGroup.worldToLocal(_questHeadPosWorldAdj);
+    g.userData.targetPos.copy(_questHeadPosWorldAdj);
+    if (g.userData.targetStylusPos) {
+      _questHeadPosWorldAdj.copy(g.userData.targetStylusPos);
+      contentGroup.localToWorld(_questHeadPosWorldAdj);
+      _questHeadPosWorldAdj.y += QUEST_FOLLOW_HEAD_WORLD_Y_EXTRA_M;
+      contentGroup.worldToLocal(_questHeadPosWorldAdj);
+      g.userData.targetStylusPos.copy(_questHeadPosWorldAdj);
+    }
+  }
+}
+
+/** @returns {{ id: string, label: string }[]} */
+function collectXrHeadPeers() {
+  const list = [];
+  for (const [id, g] of viewerRemotePeers) {
+    if (g.userData.mode === "xr_head") {
+      list.push({ id, label: typeof g.userData.presenceLabel === "string" ? g.userData.presenceLabel : "Quest" });
+    }
+  }
+  list.sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
+  return list;
+}
+
+/**
+ * Follow mode: hide the followed Quest headset; hide desktop/preview viewer frustum + label so they
+ * do not clutter the follow view (and reduce distraction for the Quest user on broadcast).
+ */
+function updateFollowPresenceArtifactsVisibility() {
+  const id =
+    followQuestDeviceId ||
+    (elQuestFollowSelect && !elQuestFollowSelect.hidden && elQuestFollowSelect.value
+      ? elQuestFollowSelect.value
+      : null);
+  for (const [peerId, g] of viewerRemotePeers) {
+    const head = g.getObjectByName("presence-head-gltf");
+    if (head) head.visible = !followQuestActive || peerId !== id;
+
+    if (g.userData.mode === "viewer_camera") {
+      const cone = g.getObjectByName("presence-cone");
+      const label = g.getObjectByName("presence-label");
+      const showViewerArtifacts = !followQuestActive;
+      if (cone) cone.visible = showViewerArtifacts;
+      if (label) label.visible = showViewerArtifacts;
+    }
+  }
+}
+
+function syncQuestFollowSelectOptions() {
+  if (!elQuestFollowSelect) return;
+  const list = collectXrHeadPeers();
+  const key = list.map((x) => x.id).join(",");
+  if (key === lastQuestFollowSelectKey) return;
+  lastQuestFollowSelectKey = key;
+  const prev = followQuestDeviceId;
+  elQuestFollowSelect.innerHTML = "";
+  for (const { id, label } of list) {
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = label;
+    elQuestFollowSelect.appendChild(opt);
+  }
+  if (list.length === 0) {
+    followQuestDeviceId = null;
+  } else if (prev && list.some((x) => x.id === prev)) {
+    followQuestDeviceId = prev;
+    elQuestFollowSelect.value = prev;
+  } else {
+    followQuestDeviceId = list[0].id;
+    elQuestFollowSelect.value = list[0].id;
+  }
+  elQuestFollowSelect.hidden = list.length <= 1;
+}
+
+function applyFollowQuestCamera() {
+  if (!followQuestActive) return;
+  if (!viewerRoomId) {
+    setFollowQuestActive(false);
+    return;
+  }
+  const id = followQuestDeviceId || (elQuestFollowSelect ? elQuestFollowSelect.value : null);
+  if (!id) {
+    setFollowQuestActive(false);
+    setStatus("No Quest to follow.", "err");
+    return;
+  }
+  const peer = viewerRemotePeers.get(id);
+  if (!peer || peer.userData.mode !== "xr_head") {
+    setFollowQuestActive(false);
+    setStatus("Quest left the room — follow off.", "");
+    return;
+  }
+  contentGroup.updateMatrixWorld(true);
+  peer.updateMatrixWorld(true);
+  peer.getWorldPosition(_vCamPosW);
+  peer.getWorldQuaternion(_vCamQuatW);
+  /* World Y offset is applied to xr_head targetPos in handleViewerRemotePresence (world-space). */
+  const back = DEFAULT_FOLLOW_BACK_M;
+  const down = DEFAULT_FOLLOW_DOWN_M;
+  _followOffsetLocal.set(0, -down, back);
+  _followOffsetLocal.applyQuaternion(_vCamQuatW);
+  camera.position.copy(_vCamPosW).add(_followOffsetLocal);
+  /* Full head orientation (incl. roll). lookAt(worldUp) would strip sideways tilt. */
+  camera.quaternion.copy(_vCamQuatW);
+  _followCamUpWorld.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  camera.up.copy(_followCamUpWorld);
+  _fwdWorld.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  controls.target.copy(camera.position).add(_fwdWorld);
+}
+
+/** @param {boolean} active */
+function setFollowQuestActive(active) {
+  if (active === followQuestActive) return;
+  followQuestActive = active;
+  if (active) {
+    exitAxisViewIfNeeded();
+    disableAutoOrbit();
+    controls.enabled = false;
+    syncFollowSlidersFromStorage();
+    applyFollowFovToCamera();
+    if (elQuestFollowControls) {
+      elQuestFollowControls.hidden = false;
+      elQuestFollowControls.setAttribute("aria-hidden", "false");
+    }
+    if (btnQuestFollow) {
+      btnQuestFollow.classList.add("active");
+      btnQuestFollow.setAttribute("aria-pressed", "true");
+    }
+  } else {
+    camera.fov = DEFAULT_VIEWER_FOV;
+    camera.up.set(0, 1, 0);
+    camera.updateProjectionMatrix();
+    if (elQuestFollowControls) {
+      elQuestFollowControls.hidden = true;
+      elQuestFollowControls.setAttribute("aria-hidden", "true");
+    }
+    if (btnQuestFollow) {
+      btnQuestFollow.classList.remove("active");
+      btnQuestFollow.setAttribute("aria-pressed", "false");
+    }
+    if (!renderer.xr.isPresenting && (getViewMode() === "2d" || getViewMode() === "align")) {
+      controls.enabled = true;
+    }
+  }
+  updateFollowPresenceArtifactsVisibility();
 }
 
 function applyAlignmentPayload(alignment) {
@@ -1064,6 +1394,7 @@ function applyAlignmentPayload(alignment) {
 }
 
 function stopViewerSubscription() {
+  setFollowQuestActive(false);
   if (viewerRoomRealtime) {
     viewerRoomRealtime.unsubscribe();
     viewerRoomRealtime = null;
@@ -1075,6 +1406,17 @@ function stopViewerSubscription() {
 /** @param {{ snapshot?: unknown, snapshotUpdatedAt?: unknown, alignment?: unknown }} data */
 function applyRemoteRoomData(data) {
   if (!data) return;
+  const snapAt =
+    data.snapshotUpdatedAt != null && data.snapshotUpdatedAt !== ""
+      ? String(data.snapshotUpdatedAt)
+      : null;
+  if (
+    snapAt != null &&
+    lastViewerSnapshotAppliedAt != null &&
+    snapshotTimestampIsStrictlyOlder(snapAt, lastViewerSnapshotAppliedAt)
+  ) {
+    return;
+  }
   const remotePayload =
     data.snapshot && data.snapshot.v === 1 && Array.isArray(data.snapshot.nodes)
       ? data.snapshot
@@ -1092,6 +1434,7 @@ function applyRemoteRoomData(data) {
     /* Do not reset orbit target to origin — that “snaps” the view and has caused preview crashes on tablets. */
     detachTransformKeepOrbitTarget();
     try {
+      let didInitialFrameThisApply = false;
       if (!viewerDidInitialFraming) {
         contentGroup.position.set(0, 0, 0);
         contentGroup.quaternion.identity();
@@ -1102,11 +1445,19 @@ function applyRemoteRoomData(data) {
         remotePayload,
         localPayload,
         viewerPendingSyncIds,
+        viewerDeletedSyncIds,
       );
-      applyScenePayloadIncremental(merged, material, contentGroup);
+      for (const id of [...viewerDeletedSyncIds]) {
+        if (!merged.nodes.some((n) => nodeIdFromPayload(n) === id)) {
+          viewerDeletedSyncIds.delete(id);
+        }
+      }
+      applyScenePayloadIncremental(merged, voxelMaterial, contentGroup);
+      if (snapAt != null) lastViewerSnapshotAppliedAt = snapAt;
       if (!viewerDidInitialFraming) {
         frameContentAtOrigin();
         viewerDidInitialFraming = true;
+        didInitialFrameThisApply = true;
       }
       if (getViewMode() === "align") {
         applyAlignmentPayload(data.alignment);
@@ -1114,18 +1465,32 @@ function applyRemoteRoomData(data) {
         alignmentGroup.matrix.identity();
         alignmentGroup.matrixAutoUpdate = true;
       }
+      if (didInitialFrameThisApply) {
+        syncOrbitTargetToSketchOrigin();
+      }
       controls.update();
       setStatus("Updated.", "ok");
     } catch (err) {
       console.warn(err);
+      let didInitialFrameThisApply = false;
       try {
-        applyScenePayloadIncremental({ v: 1, nodes: [] }, material, contentGroup);
+        applyScenePayloadIncremental({ v: 1, nodes: [] }, voxelMaterial, contentGroup);
       } catch (_) {
         /* ignore */
       }
       if (!viewerDidInitialFraming) {
         frameContentAtOrigin();
         viewerDidInitialFraming = true;
+        didInitialFrameThisApply = true;
+      }
+      if (getViewMode() === "align") {
+        applyAlignmentPayload(data.alignment);
+      } else {
+        alignmentGroup.matrix.identity();
+        alignmentGroup.matrixAutoUpdate = true;
+      }
+      if (didInitialFrameThisApply) {
+        syncOrbitTargetToSketchOrigin();
       }
       controls.update();
       setStatus("Scene data error — check Quest broadcast.", "err");
@@ -1156,6 +1521,7 @@ async function refreshViewerRoomFromServer() {
 function startRoomSync() {
   stopViewerSubscription();
   viewerRoomId = "";
+  lastViewerSnapshotAppliedAt = null;
   const room = normalizeRoomCode(elRoom.value || "");
   if (!room) {
     setStatus("Enter a room code.", "err");
@@ -1208,6 +1574,7 @@ elRoom.addEventListener("input", () => {
 elRoom.addEventListener("change", () => {
   updateStylusDrawRoomAvailability();
   lastSnapshotKey = "";
+  lastViewerSnapshotAppliedAt = null;
   viewerDidInitialFraming = false;
   startRoomSync();
 });
@@ -1222,6 +1589,7 @@ for (const el of document.querySelectorAll('input[name="mode"]')) {
     if (m) u.searchParams.set("mode", m);
     history.replaceState({}, "", u);
     lastSnapshotKey = "";
+    lastViewerSnapshotAppliedAt = null;
     void refreshViewerRoomFromServer();
     syncAxisViewFabVisibility();
   });
@@ -1236,18 +1604,17 @@ function ensureSceneGraphFor2d() {
   alignmentGroup.quaternion.identity();
   alignmentGroup.scale.set(1, 1, 1);
   controls.enabled = true;
-  gridHelper.visible = true;
   transformControl.visible = transformControl.object != null;
   syncAxisViewFabVisibility();
 }
 
 function ensureSceneGraphForAr() {
+  setFollowQuestActive(false);
   exitAxisViewIfNeeded();
   disableAutoOrbit();
   controls.enabled = false;
   detachTransformClean();
   transformControl.visible = false;
-  gridHelper.visible = false;
   if (alignmentGroup.parent === scene) scene.remove(alignmentGroup);
   arRig.add(alignmentGroup);
   camera.add(arRig);
@@ -1270,11 +1637,12 @@ btnAutoOrbit?.addEventListener("click", (e) => {
   e.stopPropagation();
   if (getViewMode() !== "2d" && getViewMode() !== "align") return;
   if (renderer.xr.isPresenting) return;
+  if (followQuestActive) setFollowQuestActive(false);
   if (controls.autoRotate) {
     disableAutoOrbit();
     return;
   }
-  controls.target.set(0, 0, 0);
+  setControlsTargetToSketchWorldOrigin();
   controls.autoRotateSpeed = AUTO_ORBIT_SPEED;
   controls.autoRotate = true;
   controls.update();
@@ -1588,6 +1956,7 @@ async function postViewerSnapshot(removedIds) {
     removedIds instanceof Set
       ? removedIds
       : new Set(Array.isArray(removedIds) ? removedIds : []);
+  for (const id of removedSet) viewerDeletedSyncIds.add(id);
   contentGroup.updateMatrixWorld(true);
   const localPayload = serializeStrokesGroup(contentGroup);
   if (!localPayload.nodes.length && removedSet.size === 0) return;
@@ -1602,13 +1971,20 @@ async function postViewerSnapshot(removedIds) {
       remoteSnap && remoteSnap.v === 1 && Array.isArray(remoteSnap.nodes)
         ? remoteSnap
         : { v: 1, nodes: [] };
-    const merged =
-      removedSet.size > 0
-        ? mergeScenePayloadsWithRemovals(localPayload, remote, removedSet)
-        : mergeScenePayloads(localPayload, remote);
+    const merged = mergeScenePayloadsForPush(
+      localPayload,
+      remote,
+      viewerDeletedSyncIds,
+      viewerPendingSyncIds,
+    );
     await upsertSnapshot(sb, viewerRoomId, merged);
     for (const n of merged.nodes) {
       viewerPendingSyncIds.delete(nodeIdFromPayload(n));
+    }
+    for (const id of [...viewerDeletedSyncIds]) {
+      if (!merged.nodes.some((n) => nodeIdFromPayload(n) === id)) {
+        viewerDeletedSyncIds.delete(id);
+      }
     }
     lastSnapshotKey = "";
     setStatus(removedSet.size > 0 ? "Scene updated." : "Stroke synced.", "ok");
@@ -1684,7 +2060,8 @@ canvas.addEventListener("pointerdown", (e) => {
     const p0 =
       typeof e.pressure === "number" && e.pressure > 0 ? e.pressure : 0.5;
     stylusPreviewPainter = new TubePainter();
-    stylusPreviewPainter.mesh.material = material;
+    stylusPreviewPainter.mesh.material =
+      getStrokeMaterialForHex(DEFAULT_STROKE_COLOR_HEX);
     const w = strokeWidthFromPressure(p0);
     stylusPreviewPainter.setSize(w);
     stylusPreviewPainter.mesh.userData.strokeWidth = w;
@@ -1888,7 +2265,6 @@ canvas.addEventListener("pointerup", (e) => {
 renderer.setAnimationLoop(() => {
   const xr = renderer.xr.isPresenting;
   const mode2d = getViewMode() === "2d" || getViewMode() === "align";
-  gridHelper.visible = !xr;
   transformControl.visible =
     !xr &&
     mode2d &&
@@ -1899,8 +2275,33 @@ renderer.setAnimationLoop(() => {
   if (elMultiSelectToolbar && !elMultiSelectToolbar.hidden) {
     updateMultiSelectToolbarPosition();
   }
-  applyWasdMovement();
-  controls.update();
+
+  if (viewerRemotePeers.size > 0) {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - viewerLastPresenceSmoothMs) / 1000);
+    viewerLastPresenceSmoothMs = now;
+    updateRemotePresenceViewerScale();
+    const presencePosScaleComp = 1 / Math.max(remotePresenceGroup.scale.x, 1e-6);
+    smoothPresencePeers(viewerRemotePeers, dt, 14, presencePosScaleComp);
+    applyViewerPresenceRenderHints();
+    remotePresenceGroup.visible = viewerShowOthers;
+    pruneStalePresencePeers(viewerRemotePeers, now, 6000);
+  }
+  syncQuestFollowSelectOptions();
+  if (
+    followQuestActive &&
+    (keys.forward || keys.back || keys.left || keys.right || keys.up || keys.down)
+  ) {
+    setFollowQuestActive(false);
+    setStatus("Follow off.", "ok");
+  }
+  if (followQuestActive) {
+    applyFollowQuestCamera();
+    updateFollowPresenceArtifactsVisibility();
+  } else {
+    applyWasdMovement();
+    controls.update();
+  }
 
   if (viewerRoomId && viewerRoomRealtime) {
     const now = performance.now();
@@ -1924,18 +2325,9 @@ renderer.setAnimationLoop(() => {
         qy: _vCamLocalQuat.y,
         qz: _vCamLocalQuat.z,
         qw: _vCamLocalQuat.w,
+        ...(followQuestActive ? { followActive: true } : {}),
       });
     }
-  }
-  if (viewerRemotePeers.size > 0) {
-    const now = performance.now();
-    const dt = Math.min(0.1, (now - viewerLastPresenceSmoothMs) / 1000);
-    viewerLastPresenceSmoothMs = now;
-    smoothPresencePeers(viewerRemotePeers, dt);
-    updateRemotePresenceViewerScale();
-    applyViewerPresenceRenderHints();
-    remotePresenceGroup.visible = viewerShowOthers;
-    pruneStalePresencePeers(viewerRemotePeers, now, 6000);
   }
 
   renderer.render(scene, camera);
@@ -1952,5 +2344,65 @@ if (elViewerShowOthers) {
     remotePresenceGroup.visible = viewerShowOthers;
   });
 }
+
+btnQuestFollow?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  if (getViewMode() !== "2d" && getViewMode() !== "align") return;
+  if (renderer.xr.isPresenting) return;
+  if (followQuestActive) {
+    setFollowQuestActive(false);
+    setStatus("Follow off.", "ok");
+    return;
+  }
+  syncQuestFollowSelectOptions();
+  const list = collectXrHeadPeers();
+  if (list.length === 0) {
+    setStatus("No Quest in room — enable Broadcast on Quest.", "err");
+    return;
+  }
+  if (elQuestFollowSelect && !elQuestFollowSelect.hidden && elQuestFollowSelect.value) {
+    followQuestDeviceId = elQuestFollowSelect.value;
+  } else {
+    followQuestDeviceId = list[0].id;
+  }
+  setFollowQuestActive(true);
+  setStatus("Following Quest view.", "ok");
+});
+
+elQuestFollowSelect?.addEventListener("change", () => {
+  if (elQuestFollowSelect?.value) followQuestDeviceId = elQuestFollowSelect.value;
+  updateFollowPresenceArtifactsVisibility();
+});
+
+function onQuestFollowControlInput() {
+  updateQuestFollowControlLabels();
+  persistFollowSliderValues();
+  if (followQuestActive) {
+    applyFollowFovToCamera();
+  }
+}
+elQuestFollowFov?.addEventListener("input", onQuestFollowControlInput);
+
+canvas.addEventListener(
+  "pointerdown",
+  (e) => {
+    if (!followQuestActive || e.target !== canvas) return;
+    setFollowQuestActive(false);
+    setStatus("Follow off.", "ok");
+  },
+  true,
+);
+canvas.addEventListener(
+  "wheel",
+  (e) => {
+    if (!followQuestActive || e.target !== canvas) return;
+    setFollowQuestActive(false);
+    setStatus("Follow off.", "ok");
+  },
+  { passive: true },
+);
+
+syncFollowSlidersFromStorage();
 
 startRoomSync();

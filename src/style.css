@@ -8,63 +8,396 @@ body {
   overflow: hidden;
 }
 
+body {
+  min-height: 100vh;
+}
+
 .webgl {
     position: fixed;
     top: 0;
     left: 0;
     outline: none;
+    z-index: 0;
 }
 
-.grid-controls {
+/* Touch devices (Quest Browser): avoid the full-screen canvas winning hit-tests over the lobby. */
+@media (pointer: coarse) {
+    .webgl {
+        pointer-events: none;
+    }
+}
+
+.sketchar-ui-root {
     position: fixed;
-    left: 12px;
-    bottom: 12px;
-    z-index: 10;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    font: 13px system-ui, sans-serif;
-    color: #e8e8e8;
-    background: rgba(0, 0, 0, 0.55);
-    border-radius: 8px;
+    inset: 0;
+    z-index: 11;
+    pointer-events: none;
+}
+
+.sketchar-ui-root > * {
     pointer-events: auto;
-    max-width: calc(100vw - 24px);
 }
 
-.grid-controls label {
-    white-space: nowrap;
-}
-
-.grid-controls input[type="range"] {
-    width: min(200px, 45vw);
-    vertical-align: middle;
-}
-
-.grid-controls-unit {
-    opacity: 0.75;
-}
-
-.sketchar-panel {
+.sketchar-menu-toggle {
     position: fixed;
     top: 12px;
     right: 12px;
-    z-index: 11;
-    max-width: min(420px, calc(100vw - 24px));
-    padding: 10px 12px;
-    font: 12px/1.35 system-ui, sans-serif;
+    z-index: 13;
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(12, 18, 28, 0.92);
     color: #eaeaea;
-    background: rgba(12, 18, 28, 0.88);
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.sketchar-menu-toggle svg {
+    flex-shrink: 0;
+}
+
+.sketchar-menu-toggle:hover {
+    background: rgba(24, 32, 48, 0.95);
+}
+
+.sketchar-menu-toggle:focus-visible {
+    outline: 2px solid rgba(140, 180, 255, 0.65);
+    outline-offset: 2px;
+}
+
+body.xr-presenting .sketchar-menu-toggle,
+body.xr-presenting .sketchar-menu-backdrop {
+    display: none;
+}
+
+.sketchar-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 11;
+    background: rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+}
+
+.sketchar-lobby {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 12;
+    width: min(360px, calc(100vw - 48px));
+    padding: 20px 22px;
+    font: 14px/1.4 system-ui, sans-serif;
+    color: #eaeaea;
+    background: rgba(12, 18, 28, 0.92);
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+}
+
+.sketchar-lobby-brand {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-bottom: 2px;
+}
+
+.sketchar-logo {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    width: min(182px, 100%);
+}
+
+.sketchar-room-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 11px 14px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(0, 0, 0, 0.35);
+    color: #fff;
+    font: inherit;
+    text-align: center;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    touch-action: manipulation;
+}
+
+.sketchar-lobby-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.sketchar-lobby-actions button {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 10px 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(140, 170, 230, 0.28);
+    background: linear-gradient(180deg, rgba(88, 128, 210, 0.45) 0%, rgba(56, 92, 168, 0.42) 100%);
+    color: #fff;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.sketchar-lobby-actions button .sketchar-btn-icon {
+    display: inline-flex;
+    flex-shrink: 0;
+}
+
+.sketchar-lobby-actions button .sketchar-btn-icon svg {
+    display: block;
+}
+
+.sketchar-lobby-actions button:active {
+    transform: translateY(1px);
+}
+
+.sketchar-lobby-actions button:focus-visible {
+    outline: 2px solid rgba(140, 180, 255, 0.65);
+    outline-offset: 2px;
+}
+
+.sketchar-recent {
+    margin-top: 2px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sketchar-recent-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(180, 200, 230, 0.75);
+    margin-bottom: 8px;
+}
+
+.sketchar-recent-list {
+    list-style: none;
+    max-height: 168px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.sketchar-recent-empty {
+    font-size: 12px;
+    color: rgba(200, 210, 230, 0.45);
+    padding: 0 2px;
+}
+
+.sketchar-recent-item {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(0, 0, 0, 0.28);
+    color: #e8eef8;
+    font: 600 13px ui-monospace, Menlo, monospace;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    text-align: left;
+}
+
+.sketchar-recent-item:hover {
+    background: rgba(70, 110, 200, 0.35);
+    border-color: rgba(140, 180, 255, 0.35);
+}
+
+#XRButton {
+    display: none !important;
+}
+
+.sketchar-advanced {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(400px, 92vw);
+    z-index: 12;
+    background: rgba(10, 14, 22, 0.97);
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+    transform: translateX(100%);
+    transition: transform 0.22s ease;
+    overflow-y: auto;
+}
+
+.sketchar-advanced.is-open {
+    transform: translateX(0);
+}
+
+.sketchar-advanced[aria-hidden="true"] {
+    pointer-events: none;
+}
+
+.sketchar-advanced.is-open[aria-hidden="false"] {
     pointer-events: auto;
 }
 
-.sketchar-title {
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    margin-bottom: 8px;
-    color: #a8c8ff;
+.sketchar-advanced-inner {
+    padding: 56px 16px 20px;
+    font: 12px/1.35 system-ui, sans-serif;
+    color: #eaeaea;
+}
+
+.sketchar-advanced--xr-source {
+    position: fixed !important;
+    left: -10000px !important;
+    top: 0 !important;
+    right: auto !important;
+    bottom: auto !important;
+    width: 190px !important;
+    min-height: 0 !important;
+    height: fit-content !important;
+    max-height: 92vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    transform: none !important;
+    transition: none !important;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55) !important;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 26px;
+    pointer-events: auto !important;
+    background: linear-gradient(165deg, rgba(18, 24, 36, 0.98), rgba(8, 12, 20, 0.99));
+    -webkit-font-smoothing: antialiased;
+    text-rendering: geometricPrecision;
+}
+
+.sketchar-advanced--xr-source .sketchar-advanced-inner {
+    padding: 14px 12px 16px;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.sketchar-advanced--xr-source .sketchar-broadcast,
+.sketchar-advanced--xr-source .sketchar-link,
+.sketchar-advanced--xr-source .sketchar-status {
+    font-size: 12px;
+}
+
+.sketchar-broadcast__ico {
+    flex-shrink: 0;
+    color: #8eb8ff;
+    opacity: 0.95;
+}
+
+.sketchar-advanced--xr-source .sketchar-broadcast {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    border-radius: 14px;
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sketchar-advanced--xr-source .sketchar-row--wrist-actions {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    justify-content: center;
+    align-items: center;
+    gap: 14px;
+    margin: 10px 0 8px;
+}
+
+.sketchar-advanced--xr-source .sketchar-row--wrist-undo {
+    margin-top: 2px;
+    margin-bottom: 6px;
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-btn--round {
+    transform: translateY(-1px);
+    border: 1px solid rgba(140, 185, 255, 0.42);
+    background: radial-gradient(circle at 32% 22%, rgba(110, 155, 235, 0.55), rgba(35, 52, 100, 0.82));
+    box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.12) inset,
+        0 4px 10px rgba(0, 0, 0, 0.45),
+        0 2px 3px rgba(0, 0, 0, 0.35);
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-btn--round:disabled {
+    opacity: 0.38;
+    transform: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+.sketchar-wrist-btn--round {
+    width: 46px;
+    height: 46px;
+    min-width: 46px;
+    min-height: 46px;
+    padding: 0;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(120, 170, 255, 0.35);
+    background: radial-gradient(circle at 30% 25%, rgba(90, 130, 220, 0.45), rgba(40, 60, 110, 0.75));
+    color: #eaf0ff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.sketchar-wrist-btn--round:active {
+    transform: scale(0.94);
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-btn--round:active:not(:disabled) {
+    transform: translateY(0) scale(0.96);
+    box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.08) inset,
+        0 2px 5px rgba(0, 0, 0, 0.4);
+}
+
+.sketchar-advanced--xr-source .sketchar-wrist-btn--round svg {
+    display: block;
+}
+
+.sketchar-advanced--xr-source .sketchar-row:not(.sketchar-row--wrist-actions) {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.sketchar-grid__ico {
+    display: inline-block;
+    vertical-align: -3px;
+    margin-right: 6px;
+    color: #9ec5ff;
+}
+
+.sketchar-advanced--xr-source .grid-controls {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: 4px;
+    padding: 10px 8px;
+}
+
+.sketchar-advanced--xr-source .grid-controls label {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.sketchar-advanced--xr-source .grid-controls input[type="range"] {
+    width: 100%;
 }
 
 .sketchar-row {
@@ -73,16 +406,6 @@ body {
     gap: 6px;
     align-items: center;
     margin-bottom: 8px;
-}
-
-.sketchar-row input[type="text"] {
-    flex: 1 1 120px;
-    min-width: 0;
-    padding: 6px 8px;
-    border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    background: rgba(0, 0, 0, 0.35);
-    color: #fff;
 }
 
 .sketchar-row button {
@@ -102,7 +425,7 @@ body {
 .sketchar-broadcast {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: 8px;
     cursor: pointer;
 }
@@ -118,6 +441,7 @@ body {
 .sketchar-status {
     font-size: 11px;
     opacity: 0.85;
+    margin-bottom: 10px;
 }
 
 .sketchar-status[data-state="ok"] {
@@ -126,4 +450,133 @@ body {
 
 .sketchar-status[data-state="err"] {
     color: #ff9e9e;
+}
+
+.grid-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 10px;
+    margin-top: 4px;
+    font: 13px system-ui, sans-serif;
+    color: #e8e8e8;
+    background: rgba(0, 0, 0, 0.45);
+    border-radius: 8px;
+    max-width: 100%;
+}
+
+.grid-controls label {
+    white-space: nowrap;
+}
+
+.grid-controls input[type="range"] {
+    width: min(200px, 100%);
+    vertical-align: middle;
+}
+
+.grid-controls-unit {
+    opacity: 0.75;
+}
+
+/* Left-palm stroke palette (HTMLMesh off-screen in XR; hidden on flat lobby) */
+.palm-color-menu {
+    display: none;
+}
+
+.palm-color-menu.palm-menu--xr-source {
+    display: block !important;
+    position: fixed !important;
+    left: -10000px !important;
+    top: 0 !important;
+    width: 320px !important;
+    height: 320px !important;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    overflow: hidden;
+    pointer-events: auto !important;
+    transform: none !important;
+    /* Transparent panel so only canvas + cursors bake; HTMLMesh uses backgroundColor only. */
+    background-color: transparent;
+    box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.1) inset,
+        0 12px 36px rgba(0, 0, 0, 0.55);
+}
+
+.palm-color-menu-inner {
+    width: 100%;
+    height: 100%;
+    padding: 20px 18px 18px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+.palm-color-menu-label {
+    font: 600 11px/1 system-ui, sans-serif;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgba(255, 245, 235, 0.72);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+/* Radial HSV: outer hue ring + inner SV disc (coords match script.js PALM_WHEEL_*) */
+.palm-color-wheel {
+    position: relative;
+    width: 248px;
+    height: 248px;
+    flex-shrink: 0;
+    touch-action: none;
+    cursor: pointer;
+    border-radius: 50%;
+    box-shadow:
+        0 0 0 2px rgba(255, 255, 255, 0.12) inset,
+        0 4px 18px rgba(0, 0, 0, 0.4);
+}
+
+.palm-color-wheel-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    vertical-align: top;
+}
+
+.palm-hue-cursor {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 14px;
+    height: 14px;
+    margin-left: -7px;
+    margin-top: -7px;
+    border-radius: 50%;
+    box-sizing: border-box;
+    background-color: rgba(255, 255, 255, 0.35);
+    border: 3px solid rgba(255, 255, 255, 0.95);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.65), 0 2px 8px rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+    z-index: 2;
+}
+
+.palm-sv-cursor {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    margin-left: -6px;
+    margin-top: -6px;
+    border-radius: 50%;
+    box-sizing: border-box;
+    background-color: rgba(255, 255, 255, 0.4);
+    border: 2px solid rgba(255, 255, 255, 0.95);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7), 0 2px 6px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    z-index: 3;
 }

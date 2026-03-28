@@ -1,8 +1,16 @@
 import * as THREE from "three";
 import {
+  computeGridBoxStrokeMaxVertices,
+  createGridBoxStrokePainter,
+} from "../misc/GridBoxStrokePainter.js";
+import {
   computeTubePainterMaxVertices,
   createTubePainterSized,
 } from "../misc/TubePainterSized.js";
+import {
+  DEFAULT_STROKE_COLOR_HEX,
+  getStrokeMaterialForHex,
+} from "./strokeMaterial.js";
 
 export const STROKE_WIDTH_MIN = 0.04;
 export const STROKE_WIDTH_MAX = 0.2;
@@ -68,6 +76,26 @@ export function nodeIdFromPayload(n) {
 }
 
 /**
+ * Compare Postgres `updated_at` strings (or ISO) for realtime ordering guards.
+ */
+export function snapshotTimestampsEqual(a, b) {
+  if (a == null || b == null) return false;
+  const pa = Date.parse(String(a));
+  const pb = Date.parse(String(b));
+  if (Number.isFinite(pa) && Number.isFinite(pb)) return pa === pb;
+  return String(a) === String(b);
+}
+
+/** True if `incoming` is strictly older than `lastSeen` (ignore out-of-order realtime payloads). */
+export function snapshotTimestampIsStrictlyOlder(incoming, lastSeen) {
+  if (incoming == null || lastSeen == null) return false;
+  const a = Date.parse(String(incoming));
+  const b = Date.parse(String(lastSeen));
+  if (Number.isFinite(a) && Number.isFinite(b)) return a < b;
+  return false;
+}
+
+/**
  * Union of node lists by `id`; local wins on duplicate keys.
  * @param {{ v?: number, nodes?: object[] } | null} local
  * @param {{ v?: number, nodes?: object[] } | null} remote
@@ -91,6 +119,63 @@ export function mergeScenePayloads(local, remote) {
     merged.set(id, { ...n, id });
   }
   return { v: 1, nodes: [...merged.values()] };
+}
+
+/**
+ * Quest/viewer **push** merge: propagates local deletes and avoids resurrecting
+ * strokes another client removed.
+ *
+ * - **Remote** (server) seeds the map, minus `deletedSyncIds` (local tombstones).
+ * - **Local wins** on id collision (transforms / edits).
+ * - **Local-only** nodes are kept only if `pendingSyncIds` (new stroke not yet on server).
+ *   Other local-only ids are dropped as stale (remote already deleted them).
+ *
+ * @param {{ v?: number, nodes?: object[] } | null} local
+ * @param {{ v?: number, nodes?: object[] } | null} remote
+ * @param {Set<string> | string[]} deletedSyncIds Ids locally removed; excluded from remote seed and not re-added from stale local.
+ * @param {Set<string> | string[]} pendingSyncIds New local strokes not yet confirmed by upsert.
+ */
+export function mergeScenePayloadsForPush(
+  local,
+  remote,
+  deletedSyncIds,
+  pendingSyncIds,
+) {
+  const loc =
+    local && local.v === 1 && Array.isArray(local.nodes)
+      ? local
+      : { v: 1, nodes: [] };
+  const rem =
+    remote && remote.v === 1 && Array.isArray(remote.nodes)
+      ? remote
+      : { v: 1, nodes: [] };
+  const deleted =
+    deletedSyncIds instanceof Set
+      ? deletedSyncIds
+      : new Set(Array.isArray(deletedSyncIds) ? deletedSyncIds : []);
+  const pending =
+    pendingSyncIds instanceof Set
+      ? pendingSyncIds
+      : new Set(Array.isArray(pendingSyncIds) ? pendingSyncIds : []);
+  const map = new Map();
+  for (const n of rem.nodes) {
+    const id = nodeIdFromPayload(n);
+    if (deleted.has(id)) continue;
+    map.set(id, { ...n, id });
+  }
+  for (const n of loc.nodes) {
+    const id = nodeIdFromPayload(n);
+    if (deleted.has(id)) {
+      map.delete(id);
+      continue;
+    }
+    if (map.has(id)) {
+      map.set(id, { ...n, id });
+    } else if (pending.has(id)) {
+      map.set(id, { ...n, id });
+    }
+  }
+  return { v: 1, nodes: [...map.values()] };
 }
 
 /**
@@ -129,11 +214,19 @@ export function mergeScenePayloadsWithRemovals(local, remote, removedIds) {
  * Viewer poll merge: **remote snapshot is authoritative** (deletions and Quest edits).
  * Local nodes are kept only if their id is in `pendingSyncIds` (viewer drew them; not yet on server).
  * Without this, `mergeScenePayloads(local, remote)` re-adds strokes that another device deleted.
+ * Optional `deletedSyncIds`: skip remote nodes the user deleted locally before the next push (prevents
+ * stale postgres_events from restoring them).
  * @param {{ v?: number, nodes?: object[] } | null} remote
  * @param {{ v?: number, nodes?: object[] } | null} local
  * @param {Set<string> | string[]} pendingSyncIds
+ * @param {Set<string> | string[] | null | undefined} [deletedSyncIds]
  */
-export function mergeScenePayloadsForViewerPoll(remote, local, pendingSyncIds) {
+export function mergeScenePayloadsForViewerPoll(
+  remote,
+  local,
+  pendingSyncIds,
+  deletedSyncIds,
+) {
   const rem =
     remote && remote.v === 1 && Array.isArray(remote.nodes)
       ? remote
@@ -146,9 +239,16 @@ export function mergeScenePayloadsForViewerPoll(remote, local, pendingSyncIds) {
     pendingSyncIds instanceof Set
       ? pendingSyncIds
       : new Set(Array.isArray(pendingSyncIds) ? pendingSyncIds : []);
+  const deleted =
+    deletedSyncIds != null
+      ? deletedSyncIds instanceof Set
+        ? deletedSyncIds
+        : new Set(Array.isArray(deletedSyncIds) ? deletedSyncIds : [])
+      : new Set();
   const map = new Map();
   for (const n of rem.nodes) {
     const id = nodeIdFromPayload(n);
+    if (deleted.has(id)) continue;
     map.set(id, { ...n, id });
   }
   for (const n of loc.nodes) {
@@ -166,12 +266,14 @@ export function mergeScenePayloadsForViewerPoll(remote, local, pendingSyncIds) {
  * @param {THREE.Vector3[]} pointsLocal
  * @param {number} strokeWidth
  * @param {string} id
+ * @param {number[] | null} [strokeWidths] Per-vertex widths (same length as points); optional.
  */
-export function strokeNodeFromContentPoints(pointsLocal, strokeWidth, id) {
+export function strokeNodeFromContentPoints(pointsLocal, strokeWidth, id, strokeWidths) {
   const sw =
     strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
   const pts = pointsLocal.map((p) => [p.x, p.y, p.z]);
-  return {
+  /** @type {Record<string, unknown>} */
+  const out = {
     t: "stroke",
     id,
     tr: {
@@ -182,6 +284,14 @@ export function strokeNodeFromContentPoints(pointsLocal, strokeWidth, id) {
     points: pts,
     strokeWidth: sw,
   };
+  if (
+    Array.isArray(strokeWidths) &&
+    strokeWidths.length === pts.length &&
+    strokeWidths.every((x) => typeof x === "number" && Number.isFinite(x))
+  ) {
+    out.strokeWidths = strokeWidths.map((x) => Math.round(x * 1e6) / 1e6);
+  }
+  return out;
 }
 
 /**
@@ -223,15 +333,33 @@ function serializeNode(o) {
   }
   if (o.isMesh && o.userData && o.userData.points && o.userData.points.length >= 2) {
     const pts = o.userData.points;
+    const sw =
+      o.userData.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
     /** @type {Record<string, unknown>} */
     const out = {
       t: "stroke",
       tr: snapStrokeTrIfNearIdentity(decompose(o)),
       points: pts.map((p) => [p.x, p.y, p.z]),
-      strokeWidth:
-        o.userData.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5,
+      strokeWidth: sw,
     };
+    const wArr = o.userData.strokeWidths;
+    if (
+      Array.isArray(wArr) &&
+      wArr.length === pts.length &&
+      wArr.every((x) => typeof x === "number" && Number.isFinite(x))
+    ) {
+      out.strokeWidths = wArr.map(
+        (x) => Math.round(x * 1e6) / 1e6,
+      );
+    }
+    if (
+      typeof o.userData.strokeColorHex === "number" &&
+      Number.isFinite(o.userData.strokeColorHex)
+    ) {
+      out.strokeColor = o.userData.strokeColorHex >>> 0;
+    }
     if (o.userData.syncId) out.id = o.userData.syncId;
+    if (o.userData.strokeProfile === "square") out.strokeProfile = "square";
     return out;
   }
   return null;
@@ -367,12 +495,18 @@ export function scenePayloadsEqual(a, b) {
  * @param {THREE.Material} material
  * @param {THREE.Group} target
  */
+/** Direct children with this flag are kept across apply (e.g. viewer presence, origin gizmo). */
+function shouldPreserveSceneChild(obj) {
+  return !!(obj && obj.userData && obj.userData.preserveInSceneApply);
+}
+
 export function applyScenePayloadIncremental(data, material, target) {
   if (!data || data.v !== 1 || !Array.isArray(data.nodes)) return;
   const desired = data.nodes.map((n) => ({ ...n, id: nodeIdFromPayload(n) }));
 
   const existingById = new Map();
   for (const ch of target.children) {
+    if (shouldPreserveSceneChild(ch)) continue;
     const id = ch.userData && ch.userData.syncId;
     if (typeof id === "string") existingById.set(id, ch);
   }
@@ -401,6 +535,14 @@ export function applyScenePayloadIncremental(data, material, target) {
     if (ch.parent) ch.parent.remove(ch);
   }
 
+  const preserved = [];
+  for (const ch of [...target.children]) {
+    if (shouldPreserveSceneChild(ch)) {
+      preserved.push(ch);
+      target.remove(ch);
+    }
+  }
+
   const nextSet = new Set(next);
   while (target.children.length) {
     const ch = target.children[0];
@@ -409,6 +551,9 @@ export function applyScenePayloadIncremental(data, material, target) {
   }
   for (const o of next) {
     target.add(o);
+  }
+  for (const p of preserved) {
+    target.add(p);
   }
 }
 
@@ -437,7 +582,26 @@ function buildNode(node, material) {
     );
     const sw =
       node.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
-    const mesh = buildStrokeMeshFromPoints(pts, sw, material);
+    const swArr = node.strokeWidths;
+    const strokeWidths =
+      Array.isArray(swArr) &&
+      swArr.length === pts.length &&
+      swArr.every((x) => typeof x === "number" && Number.isFinite(x))
+        ? swArr
+        : null;
+    const strokeColorHex =
+      typeof node.strokeColor === "number" && Number.isFinite(node.strokeColor)
+        ? node.strokeColor >>> 0
+        : DEFAULT_STROKE_COLOR_HEX;
+    const strokeProfile =
+      node.strokeProfile === "square" ? "square" : undefined;
+    const mesh = buildStrokeMeshFromPoints(
+      pts,
+      sw,
+      strokeWidths,
+      strokeColorHex,
+      strokeProfile,
+    );
     applyTr(mesh, node.tr);
     mesh.userData.syncId =
       node.id && typeof node.id === "string"
@@ -485,18 +649,76 @@ function buildNode(node, material) {
   return null;
 }
 
-function buildStrokeMeshFromPoints(pointsLocal, strokeWidth, material) {
+function buildStrokeMeshFromPoints(
+  pointsLocal,
+  strokeWidth,
+  strokeWidths,
+  strokeColorHex,
+  strokeProfile,
+) {
   const w =
     strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
-  const tp = createTubePainterSized(
-    computeTubePainterMaxVertices(pointsLocal.length),
-  );
-  tp.mesh.material = material;
-  tp.setSize(w);
-  tp.mesh.userData.strokeWidth = w;
-  tp.moveTo(pointsLocal[0]);
-  for (let i = 1; i < pointsLocal.length; i++) {
-    tp.lineTo(pointsLocal[i]);
+  const n = pointsLocal.length;
+  const square = strokeProfile === "square";
+  const hex =
+    typeof strokeColorHex === "number" && Number.isFinite(strokeColorHex)
+      ? strokeColorHex >>> 0
+      : DEFAULT_STROKE_COLOR_HEX;
+  const useWidths =
+    Array.isArray(strokeWidths) &&
+    strokeWidths.length === n &&
+    strokeWidths.every((x) => typeof x === "number" && Number.isFinite(x));
+
+  if (square) {
+    const gp = createGridBoxStrokePainter(computeGridBoxStrokeMaxVertices(n));
+    {
+      const m = getStrokeMaterialForHex(hex).clone();
+      m.flatShading = true;
+      gp.mesh.material = m;
+    }
+    gp.mesh.userData.strokeColorHex = hex;
+    gp.mesh.userData.strokeProfile = "square";
+    if (useWidths) {
+      gp.moveTo(pointsLocal[0]);
+      for (let i = 1; i < n; i++) {
+        gp.setSize(strokeWidths[i]);
+        gp.mesh.userData.strokeWidth = strokeWidths[i];
+        gp.lineTo(pointsLocal[i]);
+      }
+      gp.mesh.userData.strokeWidths = strokeWidths.slice();
+    } else {
+      gp.setSize(w);
+      gp.mesh.userData.strokeWidth = w;
+      gp.moveTo(pointsLocal[0]);
+      for (let i = 1; i < n; i++) {
+        gp.lineTo(pointsLocal[i]);
+      }
+      gp.mesh.userData.strokeWidths = pointsLocal.map(() => w);
+    }
+    gp.update();
+    gp.mesh.userData.points = pointsLocal.map((p) => p.clone());
+    return gp.mesh;
+  }
+
+  const tp = createTubePainterSized(computeTubePainterMaxVertices(n));
+  tp.mesh.material = getStrokeMaterialForHex(hex);
+  tp.mesh.userData.strokeColorHex = hex;
+  if (useWidths) {
+    tp.moveTo(pointsLocal[0]);
+    for (let i = 1; i < n; i++) {
+      tp.setSize(strokeWidths[i]);
+      tp.mesh.userData.strokeWidth = strokeWidths[i];
+      tp.lineTo(pointsLocal[i]);
+    }
+    tp.mesh.userData.strokeWidths = strokeWidths.slice();
+  } else {
+    tp.setSize(w);
+    tp.mesh.userData.strokeWidth = w;
+    tp.moveTo(pointsLocal[0]);
+    for (let i = 1; i < n; i++) {
+      tp.lineTo(pointsLocal[i]);
+    }
+    tp.mesh.userData.strokeWidths = pointsLocal.map(() => w);
   }
   tp.update();
   tp.mesh.userData.points = pointsLocal.map((p) => p.clone());

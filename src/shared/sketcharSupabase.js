@@ -236,21 +236,53 @@ function parsePresenceBroadcastMessage(msg) {
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
   /** @type {import("./sketcharPresence.js").SketcharPresencePayload} */
   const out = { deviceId, label, mode, x, y, z };
-  if (mode === "viewer_camera") {
-    const qx = num(p.qx);
-    const qy = num(p.qy);
-    const qz = num(p.qz);
-    const qw = num(p.qw);
-    if (
-      Number.isFinite(qx) &&
-      Number.isFinite(qy) &&
-      Number.isFinite(qz) &&
-      Number.isFinite(qw)
-    ) {
-      out.qx = qx;
-      out.qy = qy;
-      out.qz = qz;
-      out.qw = qw;
+  const qx = num(p.qx);
+  const qy = num(p.qy);
+  const qz = num(p.qz);
+  const qw = num(p.qw);
+  const haveQ =
+    Number.isFinite(qx) &&
+    Number.isFinite(qy) &&
+    Number.isFinite(qz) &&
+    Number.isFinite(qw);
+  if (mode === "viewer_camera" && haveQ) {
+    out.qx = qx;
+    out.qy = qy;
+    out.qz = qz;
+    out.qw = qw;
+  }
+  if (mode === "viewer_camera" && p.followActive === true) {
+    out.followActive = true;
+  }
+  if (mode === "xr_head" && haveQ) {
+    out.qx = qx;
+    out.qy = qy;
+    out.qz = qz;
+    out.qw = qw;
+  }
+  if (mode === "xr_head") {
+    const sx = num(p.sx);
+    const sy = num(p.sy);
+    const sz = num(p.sz);
+    if (Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(sz)) {
+      out.sx = sx;
+      out.sy = sy;
+      out.sz = sz;
+      const sqx = num(p.sqx);
+      const sqy = num(p.sqy);
+      const sqz = num(p.sqz);
+      const sqw = num(p.sqw);
+      const haveSq =
+        Number.isFinite(sqx) &&
+        Number.isFinite(sqy) &&
+        Number.isFinite(sqz) &&
+        Number.isFinite(sqw);
+      if (haveSq) {
+        out.sqx = sqx;
+        out.sqy = sqy;
+        out.sqz = sqz;
+        out.sqw = sqw;
+      }
     }
   }
   return out;

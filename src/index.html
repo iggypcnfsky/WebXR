@@ -4,31 +4,83 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sketchar — MX Ink WebXR</title>
+    <link rel="icon" href="/sketchar-logo.svg?v=1" type="image/svg+xml" />
     <link rel="stylesheet" href="./style.css">
 </head>
 <body>
     <canvas class="webgl"></canvas>
-    <div id="sketchar-panel" class="sketchar-panel" title="Live preview: sync scene to Supabase for phone viewers">
-        <div class="sketchar-title">Sketchar</div>
-        <div class="sketchar-row">
-            <input type="text" id="sketchar-slug" placeholder="e.g. A3Z9" maxlength="12" autocomplete="off" spellcheck="false" />
-            <button type="button" id="sketchar-create">New room</button>
-            <button type="button" id="sketchar-join">Use code</button>
+    <div id="sketchar-ui-root" class="sketchar-ui-root">
+        <button type="button" id="sketchar-menu-toggle" class="sketchar-menu-toggle" aria-expanded="false" aria-controls="sketchar-advanced" title="Sketchar settings"></button>
+        <div id="sketchar-menu-backdrop" class="sketchar-menu-backdrop" hidden aria-hidden="true"></div>
+        <div id="sketchar-lobby" class="sketchar-lobby">
+            <div class="sketchar-lobby-brand">
+                <img class="sketchar-logo" src="/sketchar-logo.svg?v=1" width="150" height="13" alt="Sketchar" />
+            </div>
+            <input type="text" id="sketchar-slug" class="sketchar-room-input" placeholder="Room code" maxlength="12" autocomplete="off" spellcheck="false" inputmode="text" autocapitalize="characters" enterkeyhint="done" />
+            <div class="sketchar-lobby-actions">
+                <button type="button" id="sketchar-create">
+                    <span class="sketchar-btn-icon" aria-hidden="true"></span>
+                    <span class="sketchar-btn-label">New sketch</span>
+                </button>
+                <button type="button" id="sketchar-join">
+                    <span class="sketchar-btn-icon" aria-hidden="true"></span>
+                    <span class="sketchar-btn-label">Join</span>
+                </button>
+            </div>
+            <div class="sketchar-recent" aria-label="Recent rooms">
+                <div class="sketchar-recent-label">Recent</div>
+                <ul id="sketchar-recent-list" class="sketchar-recent-list" role="list"></ul>
+            </div>
         </div>
-        <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-broadcast" /> Broadcast scene</label>
-        <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-show-others" checked /> Show other devices</label>
-        <div class="sketchar-row">
-            <button type="button" id="sketchar-pin-quest">Send alignment pin</button>
-            <button type="button" id="sketchar-copy">Copy viewer link</button>
+        <aside id="sketchar-advanced" class="sketchar-advanced" aria-label="Sketchar settings" aria-hidden="true">
+            <div class="sketchar-advanced-inner">
+                <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-broadcast" checked /> Broadcast scene</label>
+                <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-show-others" checked /> Show other devices</label>
+                <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-origin-floor" checked /> Show origin floor</label>
+                <label class="sketchar-broadcast"><input type="checkbox" id="sketchar-pick-debug" /> Show grab pick preview</label>
+                <div class="sketchar-row sketchar-row--wrist-actions">
+                    <button type="button" id="sketchar-pin-quest" class="sketchar-wrist-btn sketchar-wrist-btn--round" title="Send alignment pin" aria-label="Send alignment pin"></button>
+                    <button type="button" id="sketchar-copy" class="sketchar-wrist-btn sketchar-wrist-btn--round" title="Copy viewer link" aria-label="Copy viewer link"></button>
+                </div>
+                <div class="sketchar-row sketchar-row--wrist-actions sketchar-row--wrist-undo">
+                    <button type="button" id="sketchar-undo" class="sketchar-wrist-btn sketchar-wrist-btn--round" title="Undo last stroke" aria-label="Undo last stroke" disabled></button>
+                    <button type="button" id="sketchar-redo" class="sketchar-wrist-btn sketchar-wrist-btn--round" title="Redo stroke" aria-label="Redo stroke" disabled></button>
+                </div>
+                <div id="sketchar-viewer-link" class="sketchar-link">—</div>
+                <div id="sketchar-status" class="sketchar-status">Sketchar: idle (set VITE_SUPABASE_* in .env.local)</div>
+                <div id="stroke-width-controls" class="grid-controls" title="Maximum stroke width (pressure scales from min to this value)">
+                    <label for="stroke-width-slider">Stroke max</label>
+                    <input type="range" id="stroke-width-slider" min="0.04" max="0.2" step="0.005" value="0.2" />
+                    <span id="stroke-width-value">0.200</span>
+                    <span class="grid-controls-unit">m</span>
+                </div>
+                <div id="grid-controls" class="grid-controls" title="Cell size for drawing and grab snap (when grid mode is on)">
+                    <label for="grid-cell-slider">Grid cell</label>
+                    <input type="range" id="grid-cell-slider" min="0.04" max="0.16" step="0.005" value="0.1" />
+                    <span id="grid-cell-value">0.1000</span>
+                    <span class="grid-controls-unit">m</span>
+                </div>
+            </div>
+        </aside>
+        <div id="palm-color-menu" class="palm-color-menu" hidden aria-hidden="true" aria-label="Stroke color">
+            <div class="palm-color-menu-inner">
+                <div class="palm-color-menu-label">Color</div>
+                <div
+                    id="palm-color-wheel"
+                    class="palm-color-wheel"
+                    role="slider"
+                    aria-label="Hue ring and saturation value disc"
+                    aria-valuetext=""
+                    tabindex="0"
+                    data-fresh="0"
+                >
+                    <!-- Canvas: Three.js HTMLMesh does not rasterize CSS conic/linear gradients or mask — draw wheel in 2D. -->
+                    <canvas id="palm-color-wheel-canvas" class="palm-color-wheel-canvas" width="248" height="248" aria-hidden="true"></canvas>
+                    <div id="palm-hue-cursor" class="palm-hue-cursor" aria-hidden="true"></div>
+                    <div id="palm-sv-cursor" class="palm-sv-cursor" aria-hidden="true"></div>
+                </div>
+            </div>
         </div>
-        <div id="sketchar-viewer-link" class="sketchar-link">—</div>
-        <div id="sketchar-status" class="sketchar-status">Sketchar: idle (set VITE_SUPABASE_* in .env.local)</div>
-    </div>
-    <div id="grid-controls" class="grid-controls" title="Cell size for drawing and grab snap (when grid mode is on)">
-        <label for="grid-cell-slider">Grid cell</label>
-        <input type="range" id="grid-cell-slider" min="0.04" max="0.16" step="0.005" value="0.1" />
-        <span id="grid-cell-value">0.1000</span>
-        <span class="grid-controls-unit">m</span>
     </div>
     <script type="module" src="./script.js"></script>
 </body>

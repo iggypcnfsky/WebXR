@@ -1,13 +1,31 @@
 import * as THREE from "three";
 import Axis3d from "lucide/dist/esm/icons/axis-3d.js";
 import Boxes from "lucide/dist/esm/icons/boxes.js";
+import Copy from "lucide/dist/esm/icons/copy.js";
+import Trash2 from "lucide/dist/esm/icons/trash-2.js";
 import Clock from "lucide/dist/esm/icons/clock.js";
 import Grid3x3 from "lucide/dist/esm/icons/grid-3x3.js";
+import Link2 from "lucide/dist/esm/icons/link-2.js";
+import LogIn from "lucide/dist/esm/icons/log-in.js";
+import MapPin from "lucide/dist/esm/icons/map-pin.js";
+import Menu from "lucide/dist/esm/icons/menu.js";
+import PenLine from "lucide/dist/esm/icons/pen-line.js";
+import Radio from "lucide/dist/esm/icons/radio.js";
+import Users from "lucide/dist/esm/icons/users.js";
+import Undo2 from "lucide/dist/esm/icons/undo-2.js";
+import Redo2 from "lucide/dist/esm/icons/redo-2.js";
 import { TubePainter } from "three/examples/jsm/misc/TubePainter.js";
+import {
+  computeGridBoxStrokeMaxVertices,
+  createGridBoxStrokePainter,
+} from "./misc/GridBoxStrokePainter.js";
 import {
   computeTubePainterMaxVertices,
   createTubePainterSized,
 } from "./misc/TubePainterSized.js";
+import { patchWebXRDepthSensingMeshIfNeeded } from "./misc/xrDepthFeather.js";
+import { HTMLMesh } from "three/examples/jsm/interactive/HTMLMesh.js";
+import { InteractiveGroup } from "three/examples/jsm/interactive/InteractiveGroup.js";
 import { XRButton } from "three/examples/jsm/webxr/XRButton.js";
 import { XRControllerModelFactory } from "three/examples/jsm/webxr/XRControllerModelFactory.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -15,20 +33,35 @@ import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import {
   applyScenePayloadIncremental,
   deserializeSceneV1,
-  mergeScenePayloads,
+  mergeScenePayloadsForPush,
   mergeScenePayloadsForViewerPoll,
   nodeIdFromPayload,
+  sceneNodeIdFromObject3D,
   scenePayloadsEqual,
   serializeStrokesGroup,
+  snapshotTimestampIsStrictlyOlder,
+  snapshotTimestampsEqual,
 } from "./shared/sceneCodec.js";
+import {
+  DEFAULT_STROKE_COLOR_HEX,
+  getStrokeMaterialForHex,
+  voxelMaterial,
+} from "./shared/strokeMaterial.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
+import { loadRoomHistory, rememberRoom } from "./shared/sketcharRoomHistory.js";
 import {
   defaultPresenceLabel,
+  disposePresencePeerSubtree,
   getOrCreateDeviceId,
   getShowOthersPreference,
+  preloadPresenceHeadModel,
+  preloadPresenceStylusModel,
   pruneStalePresencePeers,
+  refreshPresenceVisualsFromStoredPayload,
   setPresenceTargetsFromPayload,
   setShowOthersPreference,
+  SKETCHAR_PRESENCE_HEAD_GLB_URL,
+  SKETCHAR_PRESENCE_STYLUS_GLB_URL,
   smoothPresencePeers,
 } from "./shared/sketcharPresence.js";
 import {
@@ -43,6 +76,9 @@ import {
 
 let camera, scene, renderer;
 let controller1, controller2;
+let controller3, controller4;
+/** @type {THREE.Group[]} Target-ray groups used for wrist HTMLMesh XR interaction (slots 0–3). */
+const xrWristUiControllers = [];
 let controllerGrip1, controllerGrip2;
 let stylus;
 /** @type {"left"|"right"|"none"} */
@@ -57,6 +93,21 @@ const strokesGroup = new THREE.Group();
 /** Parent for drawable content + grid; transformed by thumb–middle scene manip (HUD/controllers stay on scene). */
 const sceneContentRoot = new THREE.Group();
 sceneContentRoot.name = "scene-content-root";
+
+/** Axes + optional floor at content origin (0,0,0); shown in XR only. */
+let originGizmoGroup = null;
+/** @type {THREE.GridHelper | null} */
+let originFloorGrid = null;
+let showOriginFloor = true;
+/** Debug: wireframe sphere + ray at index tip matching `pickStrokeMesh` reach. */
+let showPickStrokeDebug = false;
+/** @type {THREE.Group | null} */
+let pickStrokeDebugLeft = null;
+/** @type {THREE.Group | null} */
+let pickStrokeDebugRight = null;
+/** MX Ink tip pick preview (same cone as `pickStrokeMeshFromStylusTip`; warm = free, cool = grid snap). */
+/** @type {THREE.Group | null} */
+let pickStrokeDebugStylus = null;
 
 const remotePresenceGroup = new THREE.Group();
 remotePresenceGroup.name = "remote-presence";
@@ -125,7 +176,7 @@ const smSlotR = {
 let sketcharRoomSlug = "";
 /** @type {string} */
 let sketcharRoomId = "";
-let sketcharBroadcast = false;
+let sketcharBroadcast = true;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let sketcharPushTimer = null;
 /** @type {{ unsubscribe: () => void, sendPresence: (p: import("./shared/sketcharPresence.js").SketcharPresencePayload) => void } | null} */
@@ -134,6 +185,8 @@ let sketcharRoomRealtime = null;
 let lastSketcharRemoteSeen = null;
 /** Stroke syncIds from Quest not yet confirmed by a successful upsert (see mergeScenePayloadsForViewerPoll). */
 const sketcharPendingSyncIds = new Set();
+/** Locally removed ids (tombstones) until the next merged upsert omits them or remote confirms. */
+const sketcharDeletedSyncIds = new Set();
 let sketcharPollBusy = false;
 /** Set when a remote update was skipped while drawing/grabbing; flushed once idle. */
 let sketcharPollDeferred = false;
@@ -142,17 +195,290 @@ let lastSketcharPresenceSendMs = 0;
 const SKETCHAR_PRESENCE_SEND_MS = 100;
 const _questHeadWorld = new THREE.Vector3();
 const _questHeadLocal = new THREE.Vector3();
+const _questHeadQuatWorld = new THREE.Quaternion();
+const _questHeadLocalQuat = new THREE.Quaternion();
+const _strokesWorldQuatForPresence = new THREE.Quaternion();
+const _stylusWorld = new THREE.Vector3();
+const _stylusLocal = new THREE.Vector3();
+const _stylusQuatWorld = new THREE.Quaternion();
+const _stylusLocalQuat = new THREE.Quaternion();
+
+/** Left-wrist settings panel in XR (HTMLMesh + InteractiveGroup). */
+/** @type {THREE.Group | null} */
+let wristMenuGroup = null;
+/** @type {THREE.Group | null} */
+let wristMenuOffsetGroup = null;
+/** @type {InteractiveGroup | null} */
+let wristInteractiveGroup = null;
+/** @type {InstanceType<typeof HTMLMesh> | null} */
+let wristHtmlMesh = null;
+
+/** Left-palm circular stroke-color panel (HTMLMesh + InteractiveGroup). */
+/** @type {THREE.Group | null} */
+let palmMenuGroup = null;
+/** @type {THREE.Group | null} */
+let palmMenuOffsetGroup = null;
+/** @type {InteractiveGroup | null} */
+let palmInteractiveGroup = null;
+/** @type {InstanceType<typeof HTMLMesh> | null} */
+let palmHtmlMesh = null;
+
+/** World scale for HTMLMesh (3× smaller than prior 0.5, then 1.5× larger). */
+const WRIST_MENU_CONTENT_SCALE = (0.5 / 3) * 1.5;
+/** Circular palm menu: slightly larger in world space (radial color wheel needs readable pixels). */
+const PALM_MENU_CONTENT_SCALE = WRIST_MENU_CONTENT_SCALE * 1.12;
+/** Palm outward offset (m): panel sits in front of palm surface, not behind the hand. */
+const WRIST_MENU_PALM_OFFSET_M = 0.048;
+/** Small shift along finger direction (toward tips) — lower than before “above wrist”. */
+const WRIST_MENU_FINGER_SHIFT_M = 0.022;
+/** Proximal shift (toward elbow) from wrist along the forearm axis — places the settings panel on the forearm. */
+const WRIST_MENU_FOREARM_SHIFT_M = 0.09;
+/** min dot(palmNormal, toCamera) to show menu — palm toward headset. */
+const WRIST_MENU_PALM_FACE_DOT_MIN = 0.52;
+/** Left palm menu: anchor between wrist and middle metacarpal (palm center). */
+const PALM_MENU_CENTER_LERP = 0.5;
+/** Offset along palm X (thumb +); 0 centers the color wheel on the palm. */
+const PALM_MENU_LATERAL_SHIFT_M = 0;
+/** Palm menu sits slightly farther out along volar normal than the wrist panel. */
+const PALM_MENU_PALM_OFFSET_M = 0.06;
+/** Toward fingertips; 0 keeps wheel centered on volar axis. */
+const PALM_MENU_FINGER_SHIFT_M = 0;
+/** Tip–plane distance must cross this band (m) to count as poking through the HTMLMesh layer. */
+const STYLUS_UI_PLANE_PENETRATE_EPS = 0.002;
+/** Must match `.palm-hue-ring` mask inner radius (SV disc outer radius / wheel radius). */
+const PALM_WHEEL_SV_RADIUS_NORM = 0.76;
+/** Outer edge of hue ring (wheel radius fraction). */
+const PALM_WHEEL_HUE_OUTER_NORM = 0.998;
+/** Hue cursor sits mid-band between SV disc and outer rim (matches CSS). */
+const PALM_WHEEL_HUE_CURSOR_NORM = 0.87;
+const _palmAnchorPos = new THREE.Vector3();
+const _palmScratchPos = new THREE.Vector3();
+const _wristMenuScratchPos = new THREE.Vector3();
+const _wristMenuPos = new THREE.Vector3();
+const _wristMiddleMeta = new THREE.Vector3();
+const _wristIndexMeta = new THREE.Vector3();
+const _wristToMiddle = new THREE.Vector3();
+const _wristToIndex = new THREE.Vector3();
+const _wristPalmNormal = new THREE.Vector3();
+const _wristToCamera = new THREE.Vector3();
+const _wristX = new THREE.Vector3();
+const _wristY = new THREE.Vector3();
+const _wristZ = new THREE.Vector3();
+const _wristBasis = new THREE.Matrix4();
+
+const wristUiRaycaster = new THREE.Raycaster();
+const _wristUiOrigin = new THREE.Vector3();
+const _wristUiDir = new THREE.Vector3();
+const wristMenuLastUv = new THREE.Vector2();
+const _wristUiPointerData = new THREE.Vector2();
+/** @type {{ type: string; data: THREE.Vector2 }} */
+const _wristUiSyntheticEvent = { type: "", data: _wristUiPointerData };
+let wristMenuUvValid = false;
+const palmMenuLastUv = new THREE.Vector2();
+let palmMenuUvValid = false;
+/** @type {InstanceType<typeof HTMLMesh> | null} */
+let lastStylusUiMesh = null;
+let wristUiSqueezePrev = false;
+/** True while stylus tip is dragging on the palm color wheel after plane penetration. */
+let palmWheelDragActive = false;
+const _palmWheelLastDragUv = new THREE.Vector2(-1, -1);
+/** Previous-frame signed tip distance to each UI plane (camera-side positive) for penetration clicks. */
+let wristUiPlaneDistPrev = Number.NaN;
+let palmUiPlaneDistPrev = Number.NaN;
+const _persistWristUv = new THREE.Vector2();
+let persistWristUvValid = false;
+const _persistPalmUv = new THREE.Vector2();
+let persistPalmUvValid = false;
+const _meshPlaneNormal = new THREE.Vector3();
+const _meshPlaneTipDelta = new THREE.Vector3();
+const _meshPlaneCenter = new THREE.Vector3();
+/** Last stylus–mesh hit distance (m) after pointer assist; Infinity if no hit. */
+let lastStylusUiWristHitDist = Infinity;
+let lastStylusUiPalmHitDist = Infinity;
+
+/** Active stroke color (left palm palette); synced on stroke complete. */
+let activeStrokeColorHex = DEFAULT_STROKE_COLOR_HEX;
+
+function hexToRgb(hex) {
+  const h = hex >>> 0;
+  return { r: (h >> 16) & 255, g: (h >> 8) & 255, b: h & 255 };
+}
+
+function rgbToHex(r, g, b) {
+  return (((r & 255) << 16) | ((g & 255) << 8) | (b & 255)) >>> 0;
+}
+
+/** @returns {{ h: number; s: number; v: number }} */
+function rgbToHsv(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let hh = 0;
+  if (d !== 0) {
+    if (max === rn) hh = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+    else if (max === gn) hh = ((bn - rn) / d + 2) / 6;
+    else hh = ((rn - gn) / d + 4) / 6;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return { h: hh * 360, s, v: max };
+}
+
+function hsvToRgb(h, s, v) {
+  const hh = ((h % 360) + 360) % 360;
+  const c = v * s;
+  const x = c * (1 - Math.abs(((hh / 60) % 2) - 1));
+  const m = v - c;
+  let rp = 0;
+  let gp = 0;
+  let bp = 0;
+  if (hh < 60) {
+    rp = c;
+    gp = x;
+  } else if (hh < 120) {
+    rp = x;
+    gp = c;
+  } else if (hh < 180) {
+    gp = c;
+    bp = x;
+  } else if (hh < 240) {
+    gp = x;
+    bp = c;
+  } else if (hh < 300) {
+    rp = x;
+    bp = c;
+  } else {
+    rp = c;
+    bp = x;
+  }
+  return {
+    r: Math.round((rp + m) * 255),
+    g: Math.round((gp + m) * 255),
+    b: Math.round((bp + m) * 255),
+  };
+}
+
+function forcePalmHtmlTextureUpdate() {
+  const root = document.getElementById("palm-color-menu");
+  if (root) root.setAttribute("data-fresh", String(Date.now()));
+  const map = palmHtmlMesh?.material?.map;
+  if (map && typeof map.update === "function") map.update();
+}
+
+/** Pixel size of #palm-color-wheel-canvas (must match CSS .palm-color-wheel). */
+const PALM_WHEEL_CANVAS_PX = 248;
+
+/**
+ * Paint hue ring + SV disc. HTMLMesh rasterizes canvas pixels; it does not render CSS gradients/masks.
+ */
+function drawPalmColorWheelCanvas() {
+  const canvas = document.getElementById("palm-color-wheel-canvas");
+  if (!canvas) return;
+  const rgb = hexToRgb(activeStrokeColorHex);
+  const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+  const hueDeg = hsv.h;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = PALM_WHEEL_CANVAS_PX;
+  const h = PALM_WHEEL_CANVAS_PX;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cx = w / 2;
+  const cy = h / 2;
+  const R = Math.min(w, h) / 2;
+  const rInner = R * PALM_WHEEL_SV_RADIUS_NORM;
+  const rOuter = R;
+
+  ctx.clearRect(0, 0, w, h);
+
+  for (let i = 0; i < 360; i++) {
+    const a0 = ((-90 + i) * Math.PI) / 180;
+    const a1 = ((-90 + i + 1) * Math.PI) / 180;
+    ctx.beginPath();
+    ctx.arc(cx, cy, rOuter, a0, a1);
+    ctx.arc(cx, cy, rInner, a1, a0, true);
+    ctx.closePath();
+    ctx.fillStyle = `hsl(${i}, 100%, 50%)`;
+    ctx.fill();
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, rInner, 0, Math.PI * 2);
+  ctx.clip();
+  const gradH = ctx.createLinearGradient(cx - rInner, cy, cx + rInner, cy);
+  gradH.addColorStop(0, "#ffffff");
+  gradH.addColorStop(1, `hsl(${hueDeg}, 100%, 50%)`);
+  ctx.fillStyle = gradH;
+  ctx.fillRect(cx - rInner, cy - rInner, 2 * rInner, 2 * rInner);
+  const gradV = ctx.createLinearGradient(0, cy - rInner, 0, cy + rInner);
+  gradV.addColorStop(0, "rgba(0,0,0,0)");
+  gradV.addColorStop(1, "#000000");
+  ctx.fillStyle = gradV;
+  ctx.fillRect(cx - rInner, cy - rInner, 2 * rInner, 2 * rInner);
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, rInner, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  canvas.setAttribute("data-palm-draw", String(Date.now()));
+}
+
+/**
+ * @param {number} u UV.x on #palm-color-menu (0–1)
+ * @param {number} v UV.y on #palm-color-menu (0–1)
+ */
+function applyPalmWheelFromUv(u, v) {
+  const palmRoot = document.getElementById("palm-color-menu");
+  const wheel = document.getElementById("palm-color-wheel");
+  if (!palmRoot || !wheel) return;
+  const pr = palmRoot.getBoundingClientRect();
+  const wr = wheel.getBoundingClientRect();
+  const screenX = pr.left + u * pr.width;
+  const screenY = pr.top + v * pr.height;
+  const cx = wr.left + wr.width / 2;
+  const cy = wr.top + wr.height / 2;
+  const dx = screenX - cx;
+  const dy = screenY - cy;
+  const R = Math.min(wr.width, wr.height) / 2;
+  if (R < 1e-6) return;
+  const rNorm = Math.hypot(dx, dy) / R;
+  if (rNorm > PALM_WHEEL_HUE_OUTER_NORM) return;
+  const rgb0 = hexToRgb(activeStrokeColorHex);
+  const prevHsv = rgbToHsv(rgb0.r, rgb0.g, rgb0.b);
+  if (rNorm <= PALM_WHEEL_SV_RADIUS_NORM) {
+    let nx = dx / (R * PALM_WHEEL_SV_RADIUS_NORM);
+    let ny = dy / (R * PALM_WHEEL_SV_RADIUS_NORM);
+    const len = Math.hypot(nx, ny);
+    if (len > 1) {
+      nx /= len;
+      ny /= len;
+    }
+    const ss = 0.5 * (nx + 1);
+    const vv = 0.5 * (1 - ny);
+    const rgb = hsvToRgb(prevHsv.h, ss, vv);
+    activeStrokeColorHex = rgbToHex(rgb.r, rgb.g, rgb.b);
+  } else {
+    const hh = (Math.atan2(dx, -dy) * 180) / Math.PI;
+    const h = ((hh % 360) + 360) % 360;
+    const rgb = hsvToRgb(h, prevHsv.s, prevHsv.v);
+    activeStrokeColorHex = rgbToHex(rgb.r, rgb.g, rgb.b);
+  }
+  syncPalmPaletteSelectedUi();
+  forcePalmHtmlTextureUpdate();
+}
 
 function clearSketcharRemotePeers() {
   for (const g of sketcharRemotePeers.values()) {
     remotePresenceGroup.remove(g);
-    g.traverse((o) => {
-      if (o.geometry) o.geometry.dispose();
-      if (o.material) {
-        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
-        else o.material.dispose();
-      }
-    });
+    disposePresencePeerSubtree(g);
   }
   sketcharRemotePeers.clear();
 }
@@ -194,13 +520,14 @@ function startSketcharSubscription() {
   });
 }
 
-/** Same DB instant can appear as different ISO strings (Realtime vs REST). */
-function sketcharSnapshotTimeMatches(incoming, lastSeen) {
-  if (incoming == null || lastSeen == null) return false;
-  const a = Date.parse(String(incoming));
-  const b = Date.parse(String(lastSeen));
-  if (Number.isFinite(a) && Number.isFinite(b)) return a === b;
-  return String(incoming) === String(lastSeen);
+function recordSketcharDeletionForObject3D(o) {
+  if (!o) return;
+  const raw =
+    o.userData && typeof o.userData.syncId === "string"
+      ? o.userData.syncId.trim()
+      : "";
+  const id = raw || sceneNodeIdFromObject3D(o);
+  if (id) sketcharDeletedSyncIds.add(id);
 }
 
 function scheduleSketcharPush() {
@@ -214,7 +541,8 @@ function scheduleSketcharPush() {
 
 async function pushSketcharSnapshot() {
   if (!sketcharBroadcast || !sketcharRoomSlug || !sketcharRoomId) return;
-  if (shouldDeferSketcharSceneApply()) {
+  /* Defer entire push only while a stroke is in progress (TubePainter / points in flux). Grab does not block upload. */
+  if (isStrokeActive() || currentStrokePainter !== null) {
     scheduleSketcharPush();
     return;
   }
@@ -226,19 +554,31 @@ async function pushSketcharSnapshot() {
     let remoteSnapshot = null;
     const roomData = await fetchRoomBySlug(sb, sketcharRoomSlug);
     if (roomData) remoteSnapshot = roomData.snapshot ?? null;
-    if (shouldDeferSketcharSceneApply()) {
+    if (isStrokeActive() || currentStrokePainter !== null) {
       scheduleSketcharPush();
       return;
     }
     const localPayload = serializeStrokesGroup(strokesGroup);
-    const merged = mergeScenePayloads(localPayload, remoteSnapshot);
+    const merged = mergeScenePayloadsForPush(
+      localPayload,
+      remoteSnapshot,
+      sketcharDeletedSyncIds,
+      sketcharPendingSyncIds,
+    );
     if (!scenePayloadsEqual(localPayload, merged)) {
-      applyScenePayloadIncremental(merged, material, strokesGroup);
+      if (!shouldDeferSketcharSceneApply()) {
+        applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup);
+      }
     }
     strokesGroup.updateMatrixWorld(true);
     const { updatedAt } = await upsertSnapshot(sb, sketcharRoomId, merged);
     for (const n of merged.nodes) {
       sketcharPendingSyncIds.delete(nodeIdFromPayload(n));
+    }
+    for (const id of [...sketcharDeletedSyncIds]) {
+      if (!merged.nodes.some((n) => nodeIdFromPayload(n) === id)) {
+        sketcharDeletedSyncIds.delete(id);
+      }
     }
     if (updatedAt != null) lastSketcharRemoteSeen = String(updatedAt);
     if (statusEl) {
@@ -269,7 +609,15 @@ async function handleSketcharRemoteSnapshot(ev) {
     if (
       at != null &&
       lastSketcharRemoteSeen != null &&
-      sketcharSnapshotTimeMatches(at, lastSketcharRemoteSeen)
+      snapshotTimestampsEqual(at, lastSketcharRemoteSeen)
+    ) {
+      sketcharPollDeferred = false;
+      return;
+    }
+    if (
+      at != null &&
+      lastSketcharRemoteSeen != null &&
+      snapshotTimestampIsStrictlyOlder(at, lastSketcharRemoteSeen)
     ) {
       sketcharPollDeferred = false;
       return;
@@ -285,9 +633,15 @@ async function handleSketcharRemoteSnapshot(ev) {
       remoteSnapshot,
       localPayload,
       sketcharPendingSyncIds,
+      sketcharDeletedSyncIds,
     );
+    for (const id of [...sketcharDeletedSyncIds]) {
+      if (!merged.nodes.some((n) => nodeIdFromPayload(n) === id)) {
+        sketcharDeletedSyncIds.delete(id);
+      }
+    }
     if (!scenePayloadsEqual(localPayload, merged)) {
-      applyScenePayloadIncremental(merged, material, strokesGroup);
+      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup);
     }
     strokesGroup.updateMatrixWorld(true);
     if (at !== null) lastSketcharRemoteSeen = at;
@@ -317,7 +671,15 @@ async function flushSketcharRemote() {
     if (
       at != null &&
       lastSketcharRemoteSeen != null &&
-      sketcharSnapshotTimeMatches(at, lastSketcharRemoteSeen)
+      snapshotTimestampsEqual(at, lastSketcharRemoteSeen)
+    ) {
+      sketcharPollDeferred = false;
+      return;
+    }
+    if (
+      at != null &&
+      lastSketcharRemoteSeen != null &&
+      snapshotTimestampIsStrictlyOlder(at, lastSketcharRemoteSeen)
     ) {
       sketcharPollDeferred = false;
       return;
@@ -329,9 +691,15 @@ async function flushSketcharRemote() {
       remoteSnapshot,
       localPayload,
       sketcharPendingSyncIds,
+      sketcharDeletedSyncIds,
     );
+    for (const id of [...sketcharDeletedSyncIds]) {
+      if (!merged.nodes.some((n) => nodeIdFromPayload(n) === id)) {
+        sketcharDeletedSyncIds.delete(id);
+      }
+    }
     if (!scenePayloadsEqual(localPayload, merged)) {
-      applyScenePayloadIncremental(merged, material, strokesGroup);
+      applyScenePayloadIncremental(merged, voxelMaterial, strokesGroup);
     }
     strokesGroup.updateMatrixWorld(true);
     if (at !== null) lastSketcharRemoteSeen = at;
@@ -343,6 +711,708 @@ async function flushSketcharRemote() {
   }
 }
 
+/**
+ * @param {boolean} open
+ */
+function setSketcharAdvancedDrawerOpen(open) {
+  const adv = document.getElementById("sketchar-advanced");
+  const toggle = document.getElementById("sketchar-menu-toggle");
+  const backdrop = document.getElementById("sketchar-menu-backdrop");
+  if (!adv || !toggle) return;
+  adv.classList.toggle("is-open", open);
+  adv.setAttribute("aria-hidden", open ? "false" : "true");
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  if (backdrop) {
+    backdrop.hidden = !open;
+    backdrop.setAttribute("aria-hidden", open ? "false" : "true");
+  }
+}
+
+function initSketcharMenuChrome() {
+  const toggle = document.getElementById("sketchar-menu-toggle");
+  const backdrop = document.getElementById("sketchar-menu-backdrop");
+  if (toggle) {
+    toggle.replaceChildren();
+    const menuSvg = createLucideSvgDom(Menu, 22);
+    menuSvg.setAttribute("aria-hidden", "true");
+    toggle.appendChild(menuSvg);
+    toggle.addEventListener("click", () => {
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      setSketcharAdvancedDrawerOpen(!expanded);
+    });
+  }
+  if (backdrop) {
+    backdrop.addEventListener("click", () => setSketcharAdvancedDrawerOpen(false));
+  }
+}
+
+/**
+ * Lucide default export → inline SVG for DOM (wrist panel / settings).
+ * @param {unknown} iconNode
+ * @param {number} [sizePx]
+ */
+function createLucideSvgDom(iconNode, sizePx = 18) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", String(sizePx));
+  svg.setAttribute("height", String(sizePx));
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  if (!Array.isArray(iconNode)) return svg;
+  for (const item of iconNode) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const [tag, attrs] = item;
+    const el = document.createElementNS(ns, tag);
+    if (attrs && typeof attrs === "object") {
+      for (const [k, v] of Object.entries(attrs)) {
+        if (v != null && v !== "") el.setAttribute(k, String(v));
+      }
+    }
+    svg.appendChild(el);
+  }
+  return svg;
+}
+
+function initSketcharLobbyIcons() {
+  const elCreate = document.getElementById("sketchar-create");
+  const elJoin = document.getElementById("sketchar-join");
+  const iconCreate = elCreate?.querySelector(".sketchar-btn-icon");
+  const iconJoin = elJoin?.querySelector(".sketchar-btn-icon");
+  if (iconCreate) {
+    iconCreate.replaceChildren();
+    const svg = createLucideSvgDom(PenLine, 20);
+    svg.setAttribute("aria-hidden", "true");
+    iconCreate.appendChild(svg);
+  }
+  if (iconJoin) {
+    iconJoin.replaceChildren();
+    const svg = createLucideSvgDom(LogIn, 20);
+    svg.setAttribute("aria-hidden", "true");
+    iconJoin.appendChild(svg);
+  }
+}
+
+function initSketcharAdvancedIcons() {
+  const adv = document.getElementById("sketchar-advanced");
+  if (!adv || adv.dataset.lucideIcons === "1") return;
+  adv.dataset.lucideIcons = "1";
+  const pin = document.getElementById("sketchar-pin-quest");
+  const copy = document.getElementById("sketchar-copy");
+  if (pin) {
+    pin.replaceChildren();
+    pin.appendChild(createLucideSvgDom(MapPin, 20));
+  }
+  if (copy) {
+    copy.replaceChildren();
+    copy.appendChild(createLucideSvgDom(Link2, 20));
+  }
+  const undoEl = document.getElementById("sketchar-undo");
+  const redoEl = document.getElementById("sketchar-redo");
+  if (undoEl) {
+    undoEl.replaceChildren();
+    undoEl.appendChild(createLucideSvgDom(Undo2, 20));
+  }
+  if (redoEl) {
+    redoEl.replaceChildren();
+    redoEl.appendChild(createLucideSvgDom(Redo2, 20));
+  }
+  const swLab = document.querySelector(
+    "#stroke-width-controls label[for='stroke-width-slider']",
+  );
+  if (swLab) {
+    const svg = createLucideSvgDom(PenLine, 14);
+    svg.classList.add("sketchar-grid__ico");
+    swLab.insertBefore(svg, swLab.firstChild);
+  }
+  const elBroadcast = document.getElementById("sketchar-broadcast");
+  const elShowOthers = document.getElementById("sketchar-show-others");
+  if (elBroadcast?.parentElement?.classList.contains("sketchar-broadcast")) {
+    const lab = elBroadcast.parentElement;
+    const svg = createLucideSvgDom(Radio, 15);
+    svg.classList.add("sketchar-broadcast__ico");
+    lab.insertBefore(svg, elBroadcast);
+  }
+  if (elShowOthers?.parentElement?.classList.contains("sketchar-broadcast")) {
+    const lab = elShowOthers.parentElement;
+    const svg = createLucideSvgDom(Users, 15);
+    svg.classList.add("sketchar-broadcast__ico");
+    lab.insertBefore(svg, elShowOthers);
+  }
+  const gridLab = document.querySelector("#grid-controls label[for='grid-cell-slider']");
+  if (gridLab) {
+    const svg = createLucideSvgDom(Grid3x3, 14);
+    svg.classList.add("sketchar-grid__ico");
+    gridLab.insertBefore(svg, gridLab.firstChild);
+  }
+}
+
+function setupSketcharWristXR() {
+  const adv = document.getElementById("sketchar-advanced");
+  if (!adv || !scene) return;
+
+  document.body.classList.add("xr-presenting");
+  setSketcharAdvancedDrawerOpen(false);
+  adv.classList.add("sketchar-advanced--xr-source");
+
+  wristInteractiveGroup = new InteractiveGroup();
+  for (let i = 0; i < xrWristUiControllers.length; i++) {
+    const c = xrWristUiControllers[i];
+    if (c) wristInteractiveGroup.listenToXRControllerEvents(c);
+  }
+
+  if (wristHtmlMesh) {
+    wristInteractiveGroup.remove(wristHtmlMesh);
+    wristHtmlMesh.dispose();
+    wristHtmlMesh = null;
+  }
+  if (wristInteractiveGroup.parent) {
+    wristInteractiveGroup.parent.remove(wristInteractiveGroup);
+  }
+
+  /* HTMLMesh bakes the DOM to a bitmap; use a tall, narrow panel in CSS and scale here for world size.
+     For truly crisp text at distance, SDF approaches (e.g. troika-three-text, as in XRBlocks SpatialPanel) replace this. */
+  wristHtmlMesh = new HTMLMesh(adv);
+  wristHtmlMesh.name = "sketchar-wrist-html";
+  const wristMap = wristHtmlMesh.material.map;
+  if (wristMap && renderer) {
+    wristMap.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+  }
+  wristInteractiveGroup.add(wristHtmlMesh);
+
+  wristMenuOffsetGroup = new THREE.Group();
+  wristMenuOffsetGroup.name = "wrist-menu-offset";
+  wristMenuOffsetGroup.scale.setScalar(WRIST_MENU_CONTENT_SCALE);
+  wristMenuOffsetGroup.add(wristInteractiveGroup);
+
+  if (wristMenuGroup) {
+    scene.remove(wristMenuGroup);
+    wristMenuGroup = null;
+  }
+  wristMenuGroup = new THREE.Group();
+  wristMenuGroup.name = "wrist-menu-root";
+  wristMenuGroup.add(wristMenuOffsetGroup);
+  scene.add(wristMenuGroup);
+}
+
+function setupPalmMenuXR() {
+  const palmEl = document.getElementById("palm-color-menu");
+  if (!palmEl || !scene) return;
+
+  palmEl.removeAttribute("hidden");
+  palmEl.setAttribute("aria-hidden", "false");
+  palmEl.classList.add("palm-menu--xr-source");
+
+  palmInteractiveGroup = new InteractiveGroup();
+  for (let i = 0; i < xrWristUiControllers.length; i++) {
+    const c = xrWristUiControllers[i];
+    if (c) palmInteractiveGroup.listenToXRControllerEvents(c);
+  }
+
+  if (palmHtmlMesh) {
+    palmInteractiveGroup.remove(palmHtmlMesh);
+    palmHtmlMesh.dispose();
+    palmHtmlMesh = null;
+  }
+  if (palmInteractiveGroup.parent) {
+    palmInteractiveGroup.parent.remove(palmInteractiveGroup);
+  }
+
+  palmHtmlMesh = new HTMLMesh(palmEl);
+  palmHtmlMesh.name = "palm-color-html";
+  const palmMap = palmHtmlMesh.material.map;
+  if (palmMap && renderer) {
+    palmMap.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+  }
+  palmInteractiveGroup.add(palmHtmlMesh);
+
+  palmMenuOffsetGroup = new THREE.Group();
+  palmMenuOffsetGroup.name = "palm-menu-offset";
+  palmMenuOffsetGroup.scale.setScalar(PALM_MENU_CONTENT_SCALE);
+  palmMenuOffsetGroup.add(palmInteractiveGroup);
+
+  if (palmMenuGroup) {
+    scene.remove(palmMenuGroup);
+    palmMenuGroup = null;
+  }
+  palmMenuGroup = new THREE.Group();
+  palmMenuGroup.name = "palm-menu-root";
+  palmMenuGroup.add(palmMenuOffsetGroup);
+  scene.add(palmMenuGroup);
+  syncPalmPaletteSelectedUi();
+  forcePalmHtmlTextureUpdate();
+}
+
+function teardownPalmMenuXR() {
+  palmWheelDragActive = false;
+  _palmWheelLastDragUv.set(-1, -1);
+  wristUiPlaneDistPrev = Number.NaN;
+  palmUiPlaneDistPrev = Number.NaN;
+  persistWristUvValid = false;
+  persistPalmUvValid = false;
+  const palmEl = document.getElementById("palm-color-menu");
+  if (palmHtmlMesh && palmInteractiveGroup) {
+    palmInteractiveGroup.remove(palmHtmlMesh);
+    palmHtmlMesh.dispose();
+    palmHtmlMesh = null;
+  }
+  if (palmMenuGroup && scene) {
+    scene.remove(palmMenuGroup);
+    palmMenuGroup = null;
+  }
+  palmMenuOffsetGroup = null;
+  palmInteractiveGroup = null;
+  if (palmEl) {
+    palmEl.classList.remove("palm-menu--xr-source");
+    palmEl.setAttribute("hidden", "");
+    palmEl.setAttribute("aria-hidden", "true");
+  }
+}
+
+function teardownSketcharWristXR() {
+  const adv = document.getElementById("sketchar-advanced");
+  if (wristHtmlMesh && wristInteractiveGroup) {
+    wristInteractiveGroup.remove(wristHtmlMesh);
+    wristHtmlMesh.dispose();
+    wristHtmlMesh = null;
+  }
+  if (wristMenuGroup && scene) {
+    scene.remove(wristMenuGroup);
+    wristMenuGroup = null;
+  }
+  wristMenuOffsetGroup = null;
+  wristInteractiveGroup = null;
+  if (adv) adv.classList.remove("sketchar-advanced--xr-source");
+  teardownPalmMenuXR();
+  document.body.classList.remove("xr-presenting");
+}
+
+/**
+ * @param {XRFrame} frame
+ * @param {XRSession} session
+ */
+function updateWristMenuPose(frame, session) {
+  if (!wristMenuGroup) return;
+  const refSpace = renderer.xr.getReferenceSpace();
+  if (!refSpace) return;
+
+  let src = null;
+  for (const inputSource of session.inputSources) {
+    if (inputSource.hand && inputSource.handedness === "left") {
+      src = inputSource;
+      break;
+    }
+  }
+  if (!src) {
+    wristMenuGroup.visible = false;
+    return;
+  }
+  const hand = src.hand;
+  const wristSpace = hand.get("wrist");
+  const middleSpace = hand.get("middle-finger-metacarpal");
+  const indexSpace = hand.get("index-finger-metacarpal");
+  if (!wristSpace || !middleSpace || !indexSpace) {
+    wristMenuGroup.visible = false;
+    return;
+  }
+  const wristPose = frame.getPose(wristSpace, refSpace);
+  const middlePose = frame.getPose(middleSpace, refSpace);
+  const indexPose = frame.getPose(indexSpace, refSpace);
+  if (!wristPose || !middlePose || !indexPose) {
+    wristMenuGroup.visible = false;
+    return;
+  }
+
+  const wp = wristPose.transform.position;
+  _wristMenuPos.set(wp.x, wp.y, wp.z);
+  const mp = middlePose.transform.position;
+  _wristMiddleMeta.set(mp.x, mp.y, mp.z);
+  const ip = indexPose.transform.position;
+  _wristIndexMeta.set(ip.x, ip.y, ip.z);
+
+  _wristToMiddle.subVectors(_wristMiddleMeta, _wristMenuPos);
+  _wristToIndex.subVectors(_wristIndexMeta, _wristMenuPos);
+  /* Left hand: middle × index gives normal out of the palm (volar). index × middle puts the panel on the dorsal side — wrong. Do not flip toward camera — that made the back-of-hand case pass and look inverted. */
+  _wristPalmNormal.crossVectors(_wristToMiddle, _wristToIndex);
+  if (_wristPalmNormal.lengthSq() < 1e-10) {
+    wristMenuGroup.visible = false;
+    return;
+  }
+  _wristPalmNormal.normalize();
+
+  camera.getWorldPosition(_wristToCamera);
+  _wristToCamera.sub(_wristMenuPos).normalize();
+
+  if (_wristPalmNormal.dot(_wristToCamera) < WRIST_MENU_PALM_FACE_DOT_MIN) {
+    wristMenuGroup.visible = false;
+    return;
+  }
+
+  _wristToMiddle.normalize();
+  _wristZ.copy(_wristPalmNormal);
+  _wristY.copy(_wristToMiddle);
+  _wristX.crossVectors(_wristY, _wristZ).normalize();
+  _wristY.crossVectors(_wristZ, _wristX).normalize();
+  _wristBasis.makeBasis(_wristX, _wristY, _wristZ);
+  wristMenuGroup.quaternion.setFromRotationMatrix(_wristBasis);
+
+  _wristMenuScratchPos.copy(_wristZ).multiplyScalar(WRIST_MENU_PALM_OFFSET_M);
+  _wristMenuScratchPos.addScaledVector(_wristY, WRIST_MENU_FINGER_SHIFT_M);
+  _wristMenuScratchPos.addScaledVector(_wristY, -WRIST_MENU_FOREARM_SHIFT_M);
+  wristMenuGroup.position.copy(_wristMenuPos).add(_wristMenuScratchPos);
+  wristMenuGroup.visible = true;
+}
+
+/**
+ * @param {XRFrame} frame
+ * @param {XRSession} session
+ */
+function updatePalmMenuPose(frame, session) {
+  if (!palmMenuGroup) return;
+  const refSpace = renderer.xr.getReferenceSpace();
+  if (!refSpace) return;
+
+  let src = null;
+  for (const inputSource of session.inputSources) {
+    if (inputSource.hand && inputSource.handedness === "left") {
+      src = inputSource;
+      break;
+    }
+  }
+  if (!src) {
+    palmMenuGroup.visible = false;
+    return;
+  }
+  const hand = src.hand;
+  const wristSpace = hand.get("wrist");
+  const middleSpace = hand.get("middle-finger-metacarpal");
+  const indexSpace = hand.get("index-finger-metacarpal");
+  if (!wristSpace || !middleSpace || !indexSpace) {
+    palmMenuGroup.visible = false;
+    return;
+  }
+  const wristPose = frame.getPose(wristSpace, refSpace);
+  const middlePose = frame.getPose(middleSpace, refSpace);
+  const indexPose = frame.getPose(indexSpace, refSpace);
+  if (!wristPose || !middlePose || !indexPose) {
+    palmMenuGroup.visible = false;
+    return;
+  }
+
+  const wp = wristPose.transform.position;
+  _wristMenuPos.set(wp.x, wp.y, wp.z);
+  const mp = middlePose.transform.position;
+  _wristMiddleMeta.set(mp.x, mp.y, mp.z);
+  const ip = indexPose.transform.position;
+  _wristIndexMeta.set(ip.x, ip.y, ip.z);
+
+  _wristToMiddle.subVectors(_wristMiddleMeta, _wristMenuPos);
+  _wristToIndex.subVectors(_wristIndexMeta, _wristMenuPos);
+  _wristPalmNormal.crossVectors(_wristToMiddle, _wristToIndex);
+  if (_wristPalmNormal.lengthSq() < 1e-10) {
+    palmMenuGroup.visible = false;
+    return;
+  }
+  _wristPalmNormal.normalize();
+
+  camera.getWorldPosition(_wristToCamera);
+  _wristToCamera.sub(_wristMenuPos).normalize();
+
+  if (_wristPalmNormal.dot(_wristToCamera) < WRIST_MENU_PALM_FACE_DOT_MIN) {
+    palmMenuGroup.visible = false;
+    return;
+  }
+
+  _wristToMiddle.normalize();
+  _wristZ.copy(_wristPalmNormal);
+  _wristY.copy(_wristToMiddle);
+  _wristX.crossVectors(_wristY, _wristZ).normalize();
+  _wristY.crossVectors(_wristZ, _wristX).normalize();
+  _wristBasis.makeBasis(_wristX, _wristY, _wristZ);
+  palmMenuGroup.quaternion.setFromRotationMatrix(_wristBasis);
+
+  _palmAnchorPos.lerpVectors(_wristMenuPos, _wristMiddleMeta, PALM_MENU_CENTER_LERP);
+  _palmScratchPos.set(0, 0, 0);
+  _palmScratchPos.addScaledVector(_wristX, PALM_MENU_LATERAL_SHIFT_M);
+  _palmScratchPos.addScaledVector(_wristZ, PALM_MENU_PALM_OFFSET_M);
+  _palmScratchPos.addScaledVector(_wristY, PALM_MENU_FINGER_SHIFT_M);
+  palmMenuGroup.position.copy(_palmAnchorPos).add(_palmScratchPos);
+  palmMenuGroup.visible = true;
+}
+
+function updateWristPalmMenuStylusPointerAssist() {
+  wristMenuUvValid = false;
+  palmMenuUvValid = false;
+  lastStylusUiMesh = null;
+  lastStylusUiWristHitDist = Infinity;
+  lastStylusUiPalmHitDist = Infinity;
+  if (!stylus) return;
+
+  stylus.getWorldPosition(_wristUiOrigin);
+  stylus.getWorldQuaternion(_quat);
+  _wristUiDir.set(0, 0, -1).applyQuaternion(_quat).normalize();
+  wristUiRaycaster.set(_wristUiOrigin, _wristUiDir);
+  wristUiRaycaster.far = 1.5;
+
+  let distW = Infinity;
+  let distP = Infinity;
+  /** @type {import("three").Intersection | undefined} */
+  let hitW;
+  /** @type {import("three").Intersection | undefined} */
+  let hitP;
+
+  if (wristMenuGroup?.visible && wristHtmlMesh) {
+    wristMenuGroup.updateMatrixWorld(true);
+    wristHtmlMesh.updateMatrixWorld(true);
+    const hw = wristUiRaycaster.intersectObject(wristHtmlMesh, false);
+    if (hw.length > 0) {
+      hitW = hw[0];
+      distW = hitW.distance;
+    }
+  }
+  if (palmMenuGroup?.visible && palmHtmlMesh) {
+    palmMenuGroup.updateMatrixWorld(true);
+    palmHtmlMesh.updateMatrixWorld(true);
+    const hp = wristUiRaycaster.intersectObject(palmHtmlMesh, false);
+    if (hp.length > 0) {
+      hitP = hp[0];
+      distP = hitP.distance;
+    }
+  }
+
+  if (distW < Infinity && distW <= distP && hitW) {
+    const uv = hitW.uv;
+    wristMenuLastUv.set(uv.x, 1 - uv.y);
+    wristMenuUvValid = true;
+    lastStylusUiMesh = wristHtmlMesh;
+    lastStylusUiWristHitDist = distW;
+  } else if (distP < Infinity && hitP) {
+    const uv = hitP.uv;
+    palmMenuLastUv.set(uv.x, 1 - uv.y);
+    palmMenuUvValid = true;
+    lastStylusUiMesh = palmHtmlMesh;
+    lastStylusUiPalmHitDist = distP;
+  }
+}
+
+/**
+ * Signed distance (m) from stylus tip to mesh plane (+Z local = panel front normal in world space).
+ * @param {THREE.Mesh} mesh
+ */
+function getTipSignedDistanceToMeshPlane(mesh) {
+  if (!mesh || !stylus) return Number.NaN;
+  stylus.getWorldPosition(_wristUiOrigin);
+  mesh.getWorldPosition(_meshPlaneCenter);
+  mesh.getWorldQuaternion(_quat);
+  _meshPlaneNormal.set(0, 0, 1).applyQuaternion(_quat).normalize();
+  camera.getWorldPosition(_wristToCamera);
+  _wristToCamera.sub(_meshPlaneCenter);
+  if (_meshPlaneNormal.dot(_wristToCamera) < 0) {
+    _meshPlaneNormal.negate();
+  }
+  _meshPlaneTipDelta.subVectors(_wristUiOrigin, _meshPlaneCenter);
+  return _meshPlaneTipDelta.dot(_meshPlaneNormal);
+}
+
+function stylusUiPlaneCrossed(prevD, currD) {
+  return (
+    !Number.isNaN(prevD) &&
+    !Number.isNaN(currD) &&
+    prevD * currD < 0 &&
+    Math.abs(prevD) > STYLUS_UI_PLANE_PENETRATE_EPS &&
+    Math.abs(currD) > STYLUS_UI_PLANE_PENETRATE_EPS
+  );
+}
+
+/**
+ * @param {THREE.Mesh} mesh
+ * @param {THREE.Vector2} uv
+ * @param {string} syntheticType
+ */
+function dispatchHtmlMeshPointerEvent(mesh, uv, syntheticType) {
+  if (!mesh || !uv) return;
+  _wristUiPointerData.copy(uv);
+  _wristUiSyntheticEvent.type = syntheticType;
+  mesh.dispatchEvent(_wristUiSyntheticEvent);
+}
+
+/**
+ * Wrist / palm HTMLMesh: treat MX Ink tip passing through the panel plane as click (not squeeze).
+ */
+function processStylusUiPlanePenetration() {
+  if (!stylus) return;
+  if (isDrawing || currentStrokePainter) return;
+
+  let dW = Number.NaN;
+  let dP = Number.NaN;
+  if (wristMenuGroup?.visible && wristHtmlMesh) {
+    wristHtmlMesh.updateMatrixWorld(true);
+    dW = getTipSignedDistanceToMeshPlane(wristHtmlMesh);
+  }
+  if (palmMenuGroup?.visible && palmHtmlMesh) {
+    palmHtmlMesh.updateMatrixWorld(true);
+    dP = getTipSignedDistanceToMeshPlane(palmHtmlMesh);
+  }
+
+  const wristCross = stylusUiPlaneCrossed(wristUiPlaneDistPrev, dW);
+  const palmCross = stylusUiPlaneCrossed(palmUiPlaneDistPrev, dP);
+
+  const wristEligible =
+    (wristMenuUvValid && lastStylusUiMesh === wristHtmlMesh) || persistWristUvValid;
+  const palmEligible =
+    (palmMenuUvValid && lastStylusUiMesh === palmHtmlMesh) || persistPalmUvValid;
+
+  const pickWristUv = () => {
+    if (wristMenuUvValid && lastStylusUiMesh === wristHtmlMesh) {
+      return wristMenuLastUv;
+    }
+    if (persistWristUvValid) return _persistWristUv;
+    return null;
+  };
+  const pickPalmUv = () => {
+    if (palmMenuUvValid && lastStylusUiMesh === palmHtmlMesh) {
+      return palmMenuLastUv;
+    }
+    if (persistPalmUvValid) return _persistPalmUv;
+    return null;
+  };
+
+  let didWrist = false;
+  if (wristCross && wristEligible) {
+    const uv = pickWristUv();
+    const palmAlso = palmCross && palmEligible;
+    const palmCloser =
+      palmAlso &&
+      Number.isFinite(lastStylusUiWristHitDist) &&
+      Number.isFinite(lastStylusUiPalmHitDist) &&
+      lastStylusUiPalmHitDist < lastStylusUiWristHitDist;
+    const wristWins = uv && !palmCloser;
+    if (wristWins) {
+      dispatchHtmlMeshPointerEvent(wristHtmlMesh, uv, "mousedown");
+      dispatchHtmlMeshPointerEvent(wristHtmlMesh, uv, "mouseup");
+      dispatchHtmlMeshPointerEvent(wristHtmlMesh, uv, "click");
+      didWrist = true;
+    }
+  }
+
+  if (!didWrist && palmCross && palmEligible) {
+    const uv = pickPalmUv();
+    if (uv) {
+      palmWheelDragActive = true;
+      _palmWheelLastDragUv.set(-1, -1);
+      applyPalmWheelFromUv(uv.x, uv.y);
+      _palmWheelLastDragUv.copy(uv);
+      forcePalmHtmlTextureUpdate();
+    }
+  }
+
+  if (palmWheelDragActive && (!palmMenuUvValid || lastStylusUiMesh !== palmHtmlMesh)) {
+    palmWheelDragActive = false;
+    _palmWheelLastDragUv.set(-1, -1);
+    forcePalmHtmlTextureUpdate();
+  }
+
+  wristUiPlaneDistPrev = wristMenuGroup?.visible && wristHtmlMesh ? dW : Number.NaN;
+  palmUiPlaneDistPrev = palmMenuGroup?.visible && palmHtmlMesh ? dP : Number.NaN;
+
+  if (wristMenuUvValid && lastStylusUiMesh === wristHtmlMesh) {
+    _persistWristUv.copy(wristMenuLastUv);
+    persistWristUvValid = true;
+  } else if (!wristMenuGroup?.visible) {
+    persistWristUvValid = false;
+  }
+
+  if (palmMenuUvValid && lastStylusUiMesh === palmHtmlMesh) {
+    _persistPalmUv.copy(palmMenuLastUv);
+    persistPalmUvValid = true;
+  } else if (!palmMenuGroup?.visible) {
+    persistPalmUvValid = false;
+  }
+}
+
+/** @type {"immersive-ar"|"immersive-vr"|null} */
+let cachedImmersiveSessionMode = null;
+
+async function resolveImmersiveSessionMode() {
+  if (cachedImmersiveSessionMode) return cachedImmersiveSessionMode;
+  if (!navigator.xr) return null;
+  try {
+    if (await navigator.xr.isSessionSupported("immersive-ar")) {
+      cachedImmersiveSessionMode = "immersive-ar";
+      return "immersive-ar";
+    }
+  } catch (_) {}
+  try {
+    if (await navigator.xr.isSessionSupported("immersive-vr")) {
+      cachedImmersiveSessionMode = "immersive-vr";
+      return "immersive-vr";
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function startImmersiveSession() {
+  if (!renderer?.xr) return;
+  if (renderer.xr.isPresenting) return;
+  const mode = await resolveImmersiveSessionMode();
+  if (!mode) {
+    alert("Immersive AR/VR is not available in this browser.");
+    return;
+  }
+  try {
+    const session = await navigator.xr.requestSession(mode, {
+      optionalFeatures: [
+        "local-floor",
+        "bounded-floor",
+        "layers",
+        "unbounded",
+        "hand-tracking",
+        "depth-sensing",
+      ],
+    });
+    await renderer.xr.setSession(session);
+  } catch (e) {
+    console.warn("XR session failed", e);
+    alert("Could not enter immersive mode. Check headset or permissions.");
+  }
+}
+
+function syncPalmPaletteSelectedUi() {
+  const palmRoot = document.getElementById("palm-color-menu");
+  const wheel = document.getElementById("palm-color-wheel");
+  const hueCur = document.getElementById("palm-hue-cursor");
+  const svCur = document.getElementById("palm-sv-cursor");
+  if (!palmRoot || !wheel || !hueCur || !svCur) return;
+  drawPalmColorWheelCanvas();
+  const rgb = hexToRgb(activeStrokeColorHex);
+  const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+  const wr = wheel.getBoundingClientRect();
+  const R = Math.min(wr.width, wr.height) / 2;
+  const rMid = R * PALM_WHEEL_HUE_CURSOR_NORM;
+  const hr = (hsv.h * Math.PI) / 180;
+  const hox = Math.sin(hr) * rMid;
+  const hoy = -Math.cos(hr) * rMid;
+  hueCur.style.left = "50%";
+  hueCur.style.top = "50%";
+  hueCur.style.margin = "0";
+  hueCur.style.transform = `translate(calc(-50% + ${hox}px), calc(-50% + ${hoy}px))`;
+  const nx = 2 * hsv.s - 1;
+  const ny = 1 - 2 * hsv.v;
+  const rsv = R * PALM_WHEEL_SV_RADIUS_NORM;
+  const svx = nx * rsv;
+  const svy = ny * rsv;
+  svCur.style.left = "50%";
+  svCur.style.top = "50%";
+  svCur.style.margin = "0";
+  svCur.style.transform = `translate(calc(-50% + ${svx}px), calc(-50% + ${svy}px))`;
+  const label = `#${(activeStrokeColorHex >>> 0).toString(16).padStart(6, "0")}`;
+  wheel.setAttribute("aria-valuetext", label);
+  palmRoot.setAttribute("data-fresh", String(Date.now()));
+}
+
 function initSketcharUI() {
   const elCreate = document.getElementById("sketchar-create");
   const elJoin = document.getElementById("sketchar-join");
@@ -351,7 +1421,53 @@ function initSketcharUI() {
   const elCopy = document.getElementById("sketchar-copy");
   const elViewerLink = document.getElementById("sketchar-viewer-link");
   const elPinQuest = document.getElementById("sketchar-pin-quest");
+  const statusEl = document.getElementById("sketchar-status");
+  const recentList = document.getElementById("sketchar-recent-list");
+
+  const palmWheel = document.getElementById("palm-color-wheel");
+  if (palmWheel) {
+    let domDrag = false;
+    const applyFromClient = (clientX, clientY) => {
+      const palmRoot = document.getElementById("palm-color-menu");
+      if (!palmRoot) return;
+      const pr = palmRoot.getBoundingClientRect();
+      const u = (clientX - pr.left) / Math.max(pr.width, 1e-6);
+      const v = (clientY - pr.top) / Math.max(pr.height, 1e-6);
+      applyPalmWheelFromUv(u, v);
+    };
+    palmWheel.addEventListener("pointerdown", (e) => {
+      domDrag = true;
+      palmWheel.setPointerCapture(e.pointerId);
+      applyFromClient(e.clientX, e.clientY);
+    });
+    palmWheel.addEventListener("pointermove", (e) => {
+      if (!domDrag) return;
+      applyFromClient(e.clientX, e.clientY);
+    });
+    palmWheel.addEventListener("pointerup", (e) => {
+      domDrag = false;
+      try {
+        palmWheel.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      forcePalmHtmlTextureUpdate();
+    });
+    palmWheel.addEventListener("pointercancel", () => {
+      domDrag = false;
+    });
+    syncPalmPaletteSelectedUi();
+  }
+
   if (!elSlug) return;
+
+  /* Quest / touch: focus the field so the OS keyboard can open; stop bubbling to WebGL layer.
+     Note: in immersive WebXR the page is not focusable — enter the room code in the browser before Enter VR. */
+  elSlug.addEventListener(
+    "touchstart",
+    () => {
+      if (document.activeElement !== elSlug) elSlug.focus();
+    },
+    { passive: true },
+  );
 
   if (elBroadcast) {
     sketcharBroadcast = elBroadcast.checked;
@@ -371,94 +1487,201 @@ function initSketcharUI() {
       remotePresenceGroup.visible = sketcharShowOthers;
     });
   }
-  if (elCreate) {
-    elCreate.addEventListener("click", async () => {
-      if (!isSketcharConfigured()) {
-        alert(
-          "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
-        );
+  const elOriginFloor = document.getElementById("sketchar-origin-floor");
+  if (elOriginFloor) {
+    try {
+      const raw = localStorage.getItem(ORIGIN_FLOOR_STORAGE_KEY);
+      if (raw === "0") {
+        elOriginFloor.checked = false;
+        showOriginFloor = false;
+      } else if (raw === "1") {
+        elOriginFloor.checked = true;
+        showOriginFloor = true;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    elOriginFloor.addEventListener("change", () => {
+      showOriginFloor = elOriginFloor.checked;
+      try {
+        localStorage.setItem(ORIGIN_FLOOR_STORAGE_KEY, showOriginFloor ? "1" : "0");
+      } catch (_) {
+        /* ignore */
+      }
+    });
+  }
+  const elPickDebug = document.getElementById("sketchar-pick-debug");
+  if (elPickDebug) {
+    try {
+      const raw = localStorage.getItem(PICK_STROKE_DEBUG_STORAGE_KEY);
+      if (raw === "1") {
+        elPickDebug.checked = true;
+        showPickStrokeDebug = true;
+      } else if (raw === "0") {
+        elPickDebug.checked = false;
+        showPickStrokeDebug = false;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    elPickDebug.addEventListener("change", () => {
+      showPickStrokeDebug = elPickDebug.checked;
+      try {
+        localStorage.setItem(PICK_STROKE_DEBUG_STORAGE_KEY, showPickStrokeDebug ? "1" : "0");
+      } catch (_) {
+        /* ignore */
+      }
+    });
+  }
+  async function applyJoinSuccess(data, canonical) {
+    stopSketcharSubscription();
+    sketcharRoomId = data.roomId;
+    sketcharRoomSlug = canonical;
+    elSlug.value = canonical;
+    currentStrokePainter = null;
+    currentStrokePointsLocal.length = 0;
+    currentStrokeWidthsLocal.length = 0;
+    lastThreeCompletedStrokes.length = 0;
+    clearStrokeUndoStacks();
+    if (data.snapshot && data.snapshot.v === 1 && Array.isArray(data.snapshot.nodes)) {
+      deserializeSceneV1(data.snapshot, voxelMaterial, strokesGroup);
+    } else {
+      deserializeSceneV1({ v: 1, nodes: [] }, voxelMaterial, strokesGroup);
+    }
+    sketcharPendingSyncIds.clear();
+    sketcharDeletedSyncIds.clear();
+    lastSketcharRemoteSeen =
+      data.snapshotUpdatedAt != null ? String(data.snapshotUpdatedAt) : null;
+    updateSketcharViewerLink(elViewerLink);
+    startSketcharSubscription();
+    if (statusEl) {
+      statusEl.textContent = data.snapshot
+        ? "Sketchar: room loaded from cloud"
+        : "Sketchar: room empty — draw to sync";
+      statusEl.dataset.state = "ok";
+    }
+    rememberRoom(canonical);
+    renderSketcharRecentRooms();
+    invalidateHudClock();
+    await startImmersiveSession();
+  }
+
+  function renderSketcharRecentRooms() {
+    if (!recentList) return;
+    recentList.replaceChildren();
+    const items = loadRoomHistory();
+    if (items.length === 0) {
+      const li = document.createElement("li");
+      li.className = "sketchar-recent-empty";
+      li.textContent = "No recent rooms yet";
+      recentList.appendChild(li);
+      return;
+    }
+    for (const { code } of items) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "sketchar-recent-item";
+      btn.textContent = code;
+      btn.title = `Join room ${code}`;
+      btn.addEventListener("click", () => {
+        elSlug.value = code;
+        void joinRoomAndEnterXr();
+      });
+      li.appendChild(btn);
+      recentList.appendChild(li);
+    }
+  }
+
+  async function joinRoomAndEnterXr() {
+    const normalized = normalizeRoomCode(elSlug.value || "");
+    if (!normalized) {
+      alert("Enter a room code.");
+      return;
+    }
+    if (!isSketcharConfigured()) {
+      alert(
+        "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+      );
+      return;
+    }
+    const sb = getSketcharSupabase();
+    if (!sb) return;
+    try {
+      const data = await fetchRoomBySlug(sb, normalized);
+      if (!data) {
+        if (statusEl) {
+          statusEl.textContent = "Sketchar: room not found";
+          statusEl.dataset.state = "err";
+        } else {
+          alert("Room not found.");
+        }
         return;
       }
-      const sb = getSketcharSupabase();
-      if (!sb) return;
-      try {
-        const { id, slug } = await createRoom(sb);
-        stopSketcharSubscription();
-        sketcharRoomId = id;
-        sketcharRoomSlug = normalizeRoomCode(slug);
-        elSlug.value = sketcharRoomSlug;
-        lastSketcharRemoteSeen = null;
-        sketcharPendingSyncIds.clear();
-        updateSketcharViewerLink(elViewerLink);
-        startSketcharSubscription();
-      } catch (e) {
-        console.warn("Sketchar create room failed", e);
-        alert("Could not create room. Check Supabase env and project.");
+      const canonical = normalizeRoomCode(data.slug);
+      await applyJoinSuccess(data, canonical);
+    } catch (e) {
+      console.warn("Sketchar join room failed", e);
+      if (statusEl) {
+        statusEl.textContent = "Sketchar: could not load room";
+        statusEl.dataset.state = "err";
+      } else {
+        alert("Could not load room. Check Supabase env.");
       }
+    }
+  }
+
+  async function createNewSketchAndEnterXr() {
+    if (!isSketcharConfigured()) {
+      alert(
+        "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
+      );
+      return;
+    }
+    const sb = getSketcharSupabase();
+    if (!sb) return;
+    try {
+      const { id, slug } = await createRoom(sb);
+      stopSketcharSubscription();
+      sketcharRoomId = id;
+      sketcharRoomSlug = normalizeRoomCode(slug);
+      elSlug.value = sketcharRoomSlug;
+      lastSketcharRemoteSeen = null;
+      sketcharPendingSyncIds.clear();
+      sketcharDeletedSyncIds.clear();
+      currentStrokePainter = null;
+      currentStrokePointsLocal.length = 0;
+      currentStrokeWidthsLocal.length = 0;
+      lastThreeCompletedStrokes.length = 0;
+      clearStrokeUndoStacks();
+      deserializeSceneV1({ v: 1, nodes: [] }, voxelMaterial, strokesGroup);
+      updateSketcharViewerLink(elViewerLink);
+      startSketcharSubscription();
+      if (statusEl) {
+        statusEl.textContent = "Sketchar: new room — draw to sync";
+        statusEl.dataset.state = "ok";
+      }
+      rememberRoom(sketcharRoomSlug);
+      renderSketcharRecentRooms();
+      invalidateHudClock();
+      await startImmersiveSession();
+    } catch (e) {
+      console.warn("Sketchar create room failed", e);
+      alert("Could not create room. Check Supabase env and project.");
+    }
+  }
+
+  if (elCreate) {
+    elCreate.addEventListener("click", () => {
+      void createNewSketchAndEnterXr();
     });
   }
   if (elJoin) {
-    elJoin.addEventListener("click", async () => {
-      const normalized = normalizeRoomCode(elSlug.value || "");
-      if (!normalized) {
-        alert("Enter a room code.");
-        return;
-      }
-      if (!isSketcharConfigured()) {
-        alert(
-          "Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (see Supabase dashboard).",
-        );
-        return;
-      }
-      const sb = getSketcharSupabase();
-      if (!sb) return;
-      const statusEl = document.getElementById("sketchar-status");
-      try {
-        const data = await fetchRoomBySlug(sb, normalized);
-        if (!data) {
-          if (statusEl) {
-            statusEl.textContent = "Sketchar: room not found";
-            statusEl.dataset.state = "err";
-          } else {
-            alert("Room not found.");
-          }
-          return;
-        }
-        stopSketcharSubscription();
-        sketcharRoomId = data.roomId;
-        const canonical = normalizeRoomCode(data.slug);
-        sketcharRoomSlug = canonical;
-        elSlug.value = canonical;
-        currentStrokePainter = null;
-        currentStrokePointsLocal.length = 0;
-        lastThreeCompletedStrokes.length = 0;
-        if (data.snapshot && data.snapshot.v === 1 && Array.isArray(data.snapshot.nodes)) {
-          deserializeSceneV1(data.snapshot, material, strokesGroup);
-        } else {
-          deserializeSceneV1({ v: 1, nodes: [] }, material, strokesGroup);
-        }
-        sketcharPendingSyncIds.clear();
-        lastSketcharRemoteSeen =
-          data.snapshotUpdatedAt != null ? String(data.snapshotUpdatedAt) : null;
-        updateSketcharViewerLink(elViewerLink);
-        startSketcharSubscription();
-        if (statusEl) {
-          statusEl.textContent = data.snapshot
-            ? "Sketchar: room loaded from cloud"
-            : "Sketchar: room empty — draw to sync";
-          statusEl.dataset.state = "ok";
-        }
-      } catch (e) {
-        console.warn("Sketchar join room failed", e);
-        if (statusEl) {
-          statusEl.textContent = "Sketchar: could not load room";
-          statusEl.dataset.state = "err";
-        } else {
-          alert("Could not load room. Check Supabase env.");
-        }
-      }
+    elJoin.addEventListener("click", () => {
+      void joinRoomAndEnterXr();
     });
   }
+  renderSketcharRecentRooms();
   if (elCopy && elViewerLink) {
     elCopy.addEventListener("click", async () => {
       const t = elViewerLink.textContent || "";
@@ -485,7 +1708,23 @@ function initSketcharUI() {
       }
     });
   }
+  const elUndo = document.getElementById("sketchar-undo");
+  const elRedo = document.getElementById("sketchar-redo");
+  if (elUndo) {
+    elUndo.addEventListener("click", () => {
+      undoLastStroke();
+    });
+  }
+  if (elRedo) {
+    elRedo.addEventListener("click", () => {
+      redoLastStroke();
+    });
+  }
+  updateStrokeUndoRedoButtons();
   updateSketcharViewerLink(elViewerLink);
+  initSketcharMenuChrome();
+  initSketcharLobbyIcons();
+  initSketcharAdvancedIcons();
 }
 
 function updateSketcharViewerLink(elViewerLink) {
@@ -502,28 +1741,36 @@ function updateSketcharViewerLink(elViewerLink) {
 let currentStrokePainter = null;
 /** Polyline in mesh-local space; copied to mesh.userData.points when stroke ends (for partial erase). */
 let currentStrokePointsLocal = [];
+/** Parallel to currentStrokePointsLocal: width for segment ending at vertex i (i>=1); index 0 mirrors stroke start. */
+let currentStrokeWidthsLocal = [];
 
 /** Last three completed stroke meshes (FIFO) for box sketch → block mode. */
 /** @type {THREE.Mesh[]} */
 const lastThreeCompletedStrokes = [];
-
-const material = new THREE.MeshNormalMaterial({
-  flatShading: true,
-  side: THREE.DoubleSide,
-});
 
 const cursor = new THREE.Vector3();
 /** Scratch for snapped stroke points (never mutate controller positions). */
 const _snapScratch = new THREE.Vector3();
 const _snapNext = new THREE.Vector3();
 const _manhSeg = new THREE.Vector3();
+/** Manhattan / draft jitter lock in `sceneContentRoot` local space (grid axes). */
+const _manhLocalA = new THREE.Vector3();
+const _manhLocalB = new THREE.Vector3();
+const _draftSnapLocalLast = new THREE.Vector3();
+const _draftSnapLocalNext = new THREE.Vector3();
 /** TubePainter geometry is mesh-local; stylus positions are world — convert before moveTo/lineTo. */
 const _strokeMeshLocal = new THREE.Vector3();
 /** Last accepted freehand sample (world) for min-distance decimation. */
 const _lastStrokeSampleWorld = new THREE.Vector3();
+/** Start of current freeform subdivide chord (scratch; lerp toward `cursor`). */
+const _strokeFreeformFromWorld = new THREE.Vector3();
+/** Interpolated tip position along chord (scratch). */
+const _strokeInterpWorld = new THREE.Vector3();
 /** Skip samples closer than this (world meters, squared) to shrink snapshots / rebuild cost. */
 const STROKE_MIN_SAMPLE_DIST_SQ = 0.00035 * 0.00035;
 const STROKE_MAX_POINTS = 100000;
+/** Freeform: max edge length (m) between polyline points — subdivide long motion so tubes stay smooth. */
+const STROKE_FREEFORM_MAX_SEGMENT_M = 0.0015;
 
 const raycaster = new THREE.Raycaster();
 const _indexTipPos = new THREE.Vector3();
@@ -539,6 +1786,10 @@ const pinchPrev = new Map();
 const thumbMiddlePinchPrev = new Map();
 /** Thumb–pinky pinch: left = block mode, right = snap-to-grid toggle (separate maps keys per hand). */
 const thumbPinkyPinchPrev = new Map();
+/** Left hand: thumb–ring duplicate while stylus rear-grab (edge-detect). */
+const thumbRingDupPinchPrev = new Map();
+/** Left hand: thumb–pinky delete while stylus rear-grab (edge-detect). */
+const thumbPinkyDelPinchPrev = new Map();
 
 /** When true, stroke points snap to world grid intersections (drawing only). */
 let snapToGridEnabled = false;
@@ -554,9 +1805,11 @@ let grabMode = "none";
 /** Previous frame grab mode — for flushing deferred Sketchar poll when grab ends. */
 let prevGrabModeForSketchar = "none";
 let grabbedMesh = null;
+/** One-hand multi-grab: all stroke roots; `grabbedMesh` is always `grabbedGrabRoots[0]` when non-empty. */
+const grabbedGrabRoots = [];
+/** Per-root world offset from ref (index / stylus) for one-hand drag. */
+const grabbedOneHandEntries = [];
 const grabOffsetWorld = new THREE.Vector3();
-/** Snapshot of ref tip/stylus at grab so offset math is not affected by shared Vector3 refs. */
-const _grabRefSnap = new THREE.Vector3();
 let grabInputSource = null;
 /** True when one-hand grab is driven by stylus position + grab button (not a hand pinch). */
 let grabInputIsStylus = false;
@@ -601,9 +1854,12 @@ const _centerLocal = new THREE.Vector3();
 const _penForward = new THREE.Vector3();
 const _snapDeltaWorld = new THREE.Vector3();
 const _snapTargetCenter = new THREE.Vector3();
+/** World-space stroke center before lattice snap (translate-only path). */
+const _snapPreWorld = new THREE.Vector3();
 const _qWorldGrab = new THREE.Quaternion();
 const _qSnapRot = new THREE.Quaternion();
 const _eulerGrabSnap = new THREE.Euler();
+const _eulerHud = new THREE.Euler();
 const _snapParentQuat = new THREE.Quaternion();
 
 const PINCH_CLOSE_DIST = 0.015;
@@ -631,6 +1887,13 @@ function gridCellSize() {
 }
 
 const GRID_LATTICE_STORAGE_KEY = "mxink-grid-divisions";
+const ORIGIN_FLOOR_STORAGE_KEY = "mxink-origin-floor";
+const PICK_STROKE_DEBUG_STORAGE_KEY = "mxink-pick-stroke-debug";
+/** XR origin floor `GridHelper` — keep in sync with viewer sketch-origin grid. */
+const ORIGIN_FLOOR_GRID_SIZE = 12;
+const ORIGIN_FLOOR_GRID_DIVISIONS = 80;
+const ORIGIN_FLOOR_GRID_COLOR1 = 0x4a5568;
+const ORIGIN_FLOOR_GRID_COLOR2 = 0x2d3748;
 
 /** Slider “target” cell (m) → integer division count so visuals and snap stay identical. */
 function applyGridLatticeFromSliderTarget(targetCellM) {
@@ -647,10 +1910,17 @@ function persistGridLatticeDivisions() {
 }
 
 /** Instanced sphere radius (m) at each voxel center — real meshes, not gl.POINTS (reliable on Quest). */
-const GRID_DOT_RADIUS = 0.0018;
+const GRID_DOT_RADIUS = 0.0014;
 /** Visual-only: place dots every Nth lattice step along each axis (snap math unchanged). */
-const GRID_DOT_VERTEX_STRIDE = 2;
-const PICK_PROXIMITY_MAX_DIST = 0.35;
+const GRID_DOT_VERTEX_STRIDE = 1;
+/**
+ * Stroke grab / erase picker (meters). Same for MX Ink and hands — change both at once:
+ * `PICK_PROXIMITY_MAX_DIST` (no ray hit: strokes within this distance) and
+ * `PICK_RAY_MAX_DIST` (ray from index tip / pen −Z; keep equal to proximity for one tuning knob).
+ */
+const PICK_PROXIMITY_MAX_DIST = 0.013;
+/** Max ray length for stroke pick (finger/stylus); matches proximity fallback so one tuning knob. */
+const PICK_RAY_MAX_DIST = PICK_PROXIMITY_MAX_DIST;
 /**
  * MX Ink → WebXR Gamepad (Quest). Logitech OpenXR: cluster_front=click, cluster_middle=force, tip=force.
  * This app: draw = middle (force), erase = front (click). On Quest Browser, cluster_front is usually buttons[0], not [2].
@@ -667,6 +1937,14 @@ const CLUSTER_MIDDLE_DRAW_THRESHOLD = 0.22;
 const CLUSTER_FRONT_ERASER_ACTIVATE = 0.02;
 const STROKE_WIDTH_MIN = 0.04;
 const STROKE_WIDTH_MAX = 0.2;
+/** Upper bound for pressure mapping; slider-adjustable (min stays STROKE_WIDTH_MIN). */
+let userStrokeWidthMax = STROKE_WIDTH_MAX;
+const STROKE_WIDTH_MAX_STORAGE_KEY = "mxink-stroke-width-max";
+
+/** LIFO completed stroke roots for wrist undo (meshes still in `strokesGroup`). */
+const strokeUndoStack = [];
+/** Detached roots after undo, for redo. */
+const strokeRedoStack = [];
 const ERASE_RADIUS = 0.038;
 const ERASE_RADIUS_SQ = ERASE_RADIUS * ERASE_RADIUS;
 
@@ -710,6 +1988,12 @@ const FINGER_DEBUG_DEFS = [
 let leftFingerDebugGroups = [];
 /** @type {Array<{ joint: string; group: THREE.Group }>} */
 let rightFingerDebugGroups = [];
+/** @type {THREE.Sprite | null} */
+let leftRingFingerSprite = null;
+/** @type {THREE.Sprite | null} */
+let leftPinkyFingerSprite = null;
+/** Avoid redundant finger-sprite texture rebuilds. */
+let lastLeftStylusGrabFingerMode = null;
 
 const sizes = {
   width: window.innerWidth,
@@ -721,6 +2005,9 @@ let hudGroup = null;
 /** @type {THREE.Mesh | null} */
 let hudTimePlane = null;
 let hudLastClockSec = -1;
+let hudLastRoomDisplay = "";
+let hudLastContentScale = -1;
+let hudLastContentYawDeg = Number.NaN;
 /** Camera-local anchor: +Y up, −Z forward (m). */
 const HUD_LOCAL_OFFSET = new THREE.Vector3(0, 0.12, -2);
 /** World size vs previous design (0.38 m tall): 70% smaller → 30% scale. */
@@ -730,6 +2017,62 @@ const HUD_FOLLOW_LAMBDA = 6.5;
 const _hudTargetWorld = new THREE.Vector3();
 const _hudTargetQuat = new THREE.Quaternion();
 let hudFollowLastMs = null;
+/** Preloaded wordmark for HUD center (`/sketchar-logo.svg`). */
+let hudLogoImage = null;
+/** Cache-bust query so Quest/browser picks up updated SVG after deploy. */
+const SKETCHAR_LOGO_URL = "/sketchar-logo.svg?v=1";
+
+function ensureHudLogoImage() {
+  if (hudLogoImage) return;
+  const img = new Image();
+  img.onload = () => {
+    invalidateHudClock();
+  };
+  img.onerror = () => {
+    hudLogoImage = null;
+  };
+  img.src = SKETCHAR_LOGO_URL;
+  hudLogoImage = img;
+}
+
+function initOriginGizmoAndFloor() {
+  originGizmoGroup = new THREE.Group();
+  originGizmoGroup.name = "origin-gizmo";
+  const axes = new THREE.AxesHelper(0.16);
+  axes.renderOrder = 10;
+  originGizmoGroup.add(axes);
+  const originDot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.007, 10, 10),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  originGizmoGroup.add(originDot);
+
+  originFloorGrid = new THREE.GridHelper(
+    ORIGIN_FLOOR_GRID_SIZE,
+    ORIGIN_FLOOR_GRID_DIVISIONS,
+    ORIGIN_FLOOR_GRID_COLOR1,
+    ORIGIN_FLOOR_GRID_COLOR2,
+  );
+  originFloorGrid.name = "origin-floor-grid";
+  originFloorGrid.renderOrder = -5;
+  originFloorGrid.visible = showOriginFloor;
+  originGizmoGroup.add(originFloorGrid);
+  originGizmoGroup.traverse((o) => {
+    if (o.isLineSegments) o.raycast = () => {};
+  });
+
+  sceneContentRoot.add(originGizmoGroup);
+}
+
+function syncOriginGizmoVisibility() {
+  if (!originGizmoGroup || !renderer) return;
+  originGizmoGroup.visible = renderer.xr.isPresenting;
+  if (originFloorGrid) originFloorGrid.visible = showOriginFloor;
+}
 
 init();
 
@@ -751,6 +2094,23 @@ function drawLucideIconNode(ctx, iconNode) {
       const r = Number(attrs.r);
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      if (attrs.fill && attrs.fill !== "none") {
+        ctx.fill();
+      }
+      if (attrs.stroke === "none") continue;
+      ctx.stroke();
+    } else if (tag === "rect" && attrs) {
+      const x = Number(attrs.x);
+      const y = Number(attrs.y);
+      const w = Number(attrs.width);
+      const h = Number(attrs.height);
+      const rx = attrs.rx != null ? Number(attrs.rx) : 0;
+      ctx.beginPath();
+      if (rx > 0 && typeof ctx.roundRect === "function") {
+        ctx.roundRect(x, y, w, h, rx);
+      } else {
+        ctx.rect(x, y, w, h);
+      }
       if (attrs.fill && attrs.fill !== "none") {
         ctx.fill();
       }
@@ -853,7 +2213,7 @@ function makeFingerLabelSprite(text) {
 
 function createTimeHud() {
   const canvas = document.createElement("canvas");
-  canvas.width = 840;
+  canvas.width = 1600;
   canvas.height = 168;
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
@@ -888,6 +2248,7 @@ function createTimeHud() {
   group.name = "hud-time";
   group.frustumCulled = false;
   group.add(mesh);
+  ensureHudLogoImage();
   return { group, mesh };
 }
 
@@ -917,13 +2278,36 @@ function updateHudFollow(timeMs) {
   hudGroup.quaternion.slerp(_hudTargetQuat, alpha);
 }
 
+function invalidateHudClock() {
+  hudLastClockSec = -1;
+  hudLastRoomDisplay = "";
+  hudLastContentScale = -1;
+  hudLastContentYawDeg = Number.NaN;
+  updateHudClock();
+}
+
 function updateHudClock() {
   if (!hudTimePlane) return;
   const { hudCanvas: canvas, hudCtx: ctx, hudTex: tex, hudClockIcon: iconNode } = hudTimePlane.userData;
   if (!canvas || !ctx || !tex) return;
   const t = Math.floor(Date.now() / 1000);
-  if (t === hudLastClockSec) return;
+  const roomDisp = sketcharRoomSlug || "";
+  const contentScale = sceneContentRoot.scale.x;
+  _eulerHud.setFromQuaternion(sceneContentRoot.quaternion, "YXZ");
+  const yawDeg = Math.round((_eulerHud.y * 180) / Math.PI * 100) / 100;
+  if (
+    t === hudLastClockSec &&
+    roomDisp === hudLastRoomDisplay &&
+    Math.abs(contentScale - hudLastContentScale) < 1e-4 &&
+    Number.isFinite(hudLastContentYawDeg) &&
+    Math.abs(yawDeg - hudLastContentYawDeg) < 0.01
+  ) {
+    return;
+  }
   hudLastClockSec = t;
+  hudLastRoomDisplay = roomDisp;
+  hudLastContentScale = contentScale;
+  hudLastContentYawDeg = yawDeg;
   const timeStr = new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
   const w = canvas.width;
   const h = canvas.height;
@@ -988,6 +2372,99 @@ function updateHudClock() {
   ctx.fillStyle = "rgba(180, 195, 220, 0.65)";
   ctx.fillText("Local time", textX, h / 2 + 24);
 
+  const leftDividerX = Math.round(w * 0.325);
+  const rightDividerX = Math.round(w * 0.7);
+  const colW = rightDividerX - leftDividerX;
+  const cxMid = (leftDividerX + rightDividerX) * 0.5;
+  const logoImg = hudLogoImage;
+  let scaleBlockTop = y0 + 16;
+  if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
+    const maxLogoW = Math.min(300, colW - 28);
+    const ar = logoImg.naturalWidth / logoImg.naturalHeight;
+    let lw = maxLogoW;
+    let lh = lw / ar;
+    const maxH = 32;
+    if (lh > maxH) {
+      lh = maxH;
+      lw = lh * ar;
+    }
+    const lx = cxMid - lw * 0.5;
+    const ly = y0 + 6;
+    ctx.drawImage(logoImg, lx, ly, lw, lh);
+    scaleBlockTop = ly + lh + 8;
+  }
+
+  const scaleT = Math.max(
+    0,
+    Math.min(
+      1,
+      (contentScale - SCENE_MANIP_SCALE_MIN) / (SCENE_MANIP_SCALE_MAX - SCENE_MANIP_SCALE_MIN),
+    ),
+  );
+  const barW = Math.min(colW - 20, 400);
+  const barH = 12;
+  const barX = cxMid - barW * 0.5;
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.font = '700 12px system-ui, sans-serif';
+  ctx.fillStyle = "rgba(160, 195, 255, 0.95)";
+  ctx.fillText("WORLD SCALE", cxMid, scaleBlockTop);
+  ctx.font = '700 34px ui-monospace, "SF Mono", Menlo, monospace';
+  ctx.fillStyle = "rgba(235, 250, 255, 0.99)";
+  ctx.fillText(`${contentScale.toFixed(2)}×`, cxMid, scaleBlockTop + 16);
+  const barY = scaleBlockTop + 58;
+  ctx.fillStyle = "rgba(32, 44, 62, 0.98)";
+  ctx.beginPath();
+  ctx.roundRect(barX, barY, barW, barH, 6);
+  ctx.fill();
+  const fillW = Math.max(barW * scaleT, scaleT > 0 ? 3 : 0);
+  if (fillW > 0) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, fillW, barH, 6);
+    ctx.clip();
+    const gBar = ctx.createLinearGradient(barX, barY, barX + barW, barY);
+    gBar.addColorStop(0, "rgba(55, 165, 255, 0.98)");
+    gBar.addColorStop(0.55, "rgba(120, 235, 255, 0.95)");
+    gBar.addColorStop(1, "rgba(200, 255, 255, 0.92)");
+    ctx.fillStyle = gBar;
+    ctx.fillRect(barX, barY, fillW, barH);
+    ctx.restore();
+  }
+  ctx.textBaseline = "middle";
+  ctx.font = '600 16px system-ui, sans-serif';
+  ctx.fillStyle = "rgba(200, 215, 245, 0.92)";
+  ctx.fillText(`Yaw ${yawDeg.toFixed(1)}°`, cxMid, barY + barH + 18);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  if (roomDisp) {
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const rx = w - margin - 22;
+    ctx.font = '600 11px system-ui, sans-serif';
+    ctx.fillStyle = "rgba(160, 185, 220, 0.75)";
+    ctx.fillText("ROOM", rx, h / 2 - 22);
+    ctx.font = '700 44px ui-monospace, "SF Mono", Menlo, monospace';
+    ctx.fillStyle = "rgba(200, 225, 255, 0.98)";
+    ctx.fillText(roomDisp, rx, h / 2 + 14);
+  } else {
+    ctx.textAlign = "right";
+    ctx.font = '500 14px system-ui, sans-serif';
+    ctx.fillStyle = "rgba(140, 155, 180, 0.45)";
+    ctx.fillText("No room — use lobby", w - margin - 22, h / 2);
+  }
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
+  ctx.lineWidth = 1;
+  for (const sx of [leftDividerX, rightDividerX]) {
+    ctx.beginPath();
+    ctx.moveTo(sx, y0 + 18);
+    ctx.lineTo(sx, y0 + bh - 18);
+    ctx.stroke();
+  }
+
   tex.needsUpdate = true;
 }
 
@@ -1043,12 +2520,14 @@ function getTipForce01() {
 }
 
 function getPressureStrokeWidth() {
-  if (!gamepad1) return (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
+  const lo = STROKE_WIDTH_MIN;
+  const hi = Math.max(lo + 1e-6, userStrokeWidthMax);
+  if (!gamepad1) return (lo + hi) * 0.5;
   const btn = gamepad1.buttons[CLUSTER_MIDDLE_DRAW_BTN_INDEX];
   const btnT = btn ? Math.min(1, Math.max(0, btn.value ?? 0)) : 0;
   const tipT = getTipForce01();
   const t = Math.min(1, Math.max(btnT, tipT));
-  return STROKE_WIDTH_MIN + t * (STROKE_WIDTH_MAX - STROKE_WIDTH_MIN);
+  return lo + t * (hi - lo);
 }
 
 /** Pen body direction in world space (tip −Z in controller space), for twist like a finger vector. */
@@ -1062,7 +2541,7 @@ function penAxisWorldInto(out) {
 /**
  * Snap to the same axis lines as THREE.GridHelper (see GridHelper: k = -halfSize + i * step).
  * Using round(v/step)*step is wrong when divisions is odd — lines are not all multiples of step from 0.
- * Operates in `sceneContentRoot` local space so the lattice stays aligned when the content root moves.
+ * Operates in `sceneContentRoot` local space so the lattice moves with world/scene transforms.
  */
 function snapWorldPointToGrid(out) {
   sceneContentRoot.updateMatrixWorld(true);
@@ -1134,8 +2613,10 @@ function snapMeshStrokeToGrid(mesh) {
 }
 
 /**
- * Snap stroke center to lattice without re-quantizing rotation. Use while dragging one-hand so
- * float drift in quaternions cannot re-round euler and shift the mesh on the first move frame.
+ * Snap stroke geometry center to lattice vertices without re-quantizing rotation. Aligns visible ink
+ * with the grid the same way draw-time `snapWorldPointToGrid` does; pivot/origin can stay off-lattice
+ * when tube or box profile is not centered on the mesh origin (fixes constant Y/axis offset vs dots).
+ * Used on grab release when snap is on.
  */
 function snapMeshStrokeToGridTranslateOnly(mesh) {
   if (!mesh) return;
@@ -1144,8 +2625,14 @@ function snapMeshStrokeToGridTranslateOnly(mesh) {
   const cl = ensureMeshCenterLocal(mesh);
   _pickV.copy(cl);
   mesh.localToWorld(_pickV);
+  _snapPreWorld.copy(_pickV);
   snapWorldPointToGrid(_pickV);
   _snapTargetCenter.copy(_pickV);
+  _snapDeltaWorld.copy(_snapTargetCenter).sub(_snapPreWorld);
+  const SNAP_TRANSLATE_EPS = 1e-6;
+  if (_snapDeltaWorld.lengthSq() < SNAP_TRANSLATE_EPS * SNAP_TRANSLATE_EPS) {
+    return;
+  }
 
   mesh.position.set(0, 0, 0);
   strokesGroup.updateMatrixWorld(true);
@@ -1159,53 +2646,142 @@ function snapMeshStrokeToGridTranslateOnly(mesh) {
   if (mesh.parent) mesh.parent.worldToLocal(mesh.position);
 }
 
+/** World-space Y span of polyline samples (path points); 0 if none. Used for release snap strategy. */
+function getStrokePathWorldYSpan(root) {
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let count = 0;
+  function visit(mesh) {
+    if (!mesh) return;
+    mesh.updateMatrixWorld(true);
+    if (mesh.isGroup && mesh.userData && mesh.userData.isStrokeCluster) {
+      for (const ch of mesh.children) visit(ch);
+      return;
+    }
+    const pts = mesh.userData && mesh.userData.points;
+    if (!pts || pts.length === 0) return;
+    for (let i = 0; i < pts.length; i++) {
+      _pickV.copy(pts[i]);
+      mesh.localToWorld(_pickV);
+      if (_pickV.y < minY) minY = _pickV.y;
+      if (_pickV.y > maxY) maxY = _pickV.y;
+      count++;
+    }
+  }
+  visit(root);
+  if (count === 0) return 0;
+  return maxY - minY;
+}
+
 /**
- * @param {boolean} [rotateSnap] When true (two-hand), full rotation+position snap. One-hand drag should pass false.
+ * Mean world delta (snap(p) - p) over path samples; same lattice rule as draw-time per point.
  */
-function snapGrabbedMeshStrokeToGrid(mesh, rotateSnap = true) {
-  if (!snapToGridEnabled || !mesh) return;
-  if (rotateSnap) snapMeshStrokeToGrid(mesh);
-  else snapMeshStrokeToGridTranslateOnly(mesh);
-}
-
-function invalidateStrokeMeshCenterLocals() {
-  strokesGroup.traverse((o) => {
-    if (o.userData) delete o.userData.centerLocal;
-  });
-}
-
-function snapAllStrokeRootsToGrid() {
+function snapMeshStrokeToGridPathConsensus(root) {
+  if (!root) return;
   strokesGroup.updateMatrixWorld(true);
-  for (const ch of strokesGroup.children) {
-    snapMeshStrokeToGrid(ch);
+  root.updateMatrixWorld(true);
+
+  _snapScratch.set(0, 0, 0);
+  let n = 0;
+  function visit(meshNode) {
+    if (!meshNode) return;
+    meshNode.updateMatrixWorld(true);
+    if (meshNode.isGroup && meshNode.userData && meshNode.userData.isStrokeCluster) {
+      for (const ch of meshNode.children) visit(ch);
+      return;
+    }
+    const pts = meshNode.userData && meshNode.userData.points;
+    if (!pts || pts.length === 0) return;
+    for (let i = 0; i < pts.length; i++) {
+      _pickV.copy(pts[i]);
+      meshNode.localToWorld(_pickV);
+      _snapPreWorld.copy(_pickV);
+      snapWorldPointToGrid(_snapPreWorld);
+      _snapDeltaWorld.copy(_snapPreWorld).sub(_pickV);
+      _snapScratch.add(_snapDeltaWorld);
+      n++;
+    }
+  }
+  visit(root);
+  if (n === 0) {
+    snapMeshStrokeToGridTranslateOnly(root);
+    return;
+  }
+  _snapDeltaWorld.copy(_snapScratch).multiplyScalar(1 / n);
+
+  root.getWorldPosition(_snapPreWorld);
+  _meshWorld.copy(_snapPreWorld).add(_snapDeltaWorld);
+
+  const SNAP_RELEASE_EPS = 1e-6;
+  if (_meshWorld.distanceToSquared(_snapPreWorld) < SNAP_RELEASE_EPS * SNAP_RELEASE_EPS) return;
+
+  root.position.copy(_meshWorld);
+  if (root.parent) root.parent.worldToLocal(root.position);
+}
+
+/**
+ * Grab release with snap on: flat polylines use pivot X/Z + centroid Y; non-flat use path-consensus.
+ */
+function snapMeshStrokeToGridReleaseHybrid(mesh) {
+  if (!mesh) return;
+  strokesGroup.updateMatrixWorld(true);
+  mesh.updateMatrixWorld(true);
+
+  const cell = gridCellSize();
+  const spanY = getStrokePathWorldYSpan(mesh);
+  const flatEps = Math.max(1e-5, cell * 1e-4);
+  if (spanY > flatEps) {
+    snapMeshStrokeToGridPathConsensus(mesh);
+    return;
+  }
+
+  const cl = ensureMeshCenterLocal(mesh);
+
+  mesh.getWorldPosition(_snapPreWorld);
+  _pickV.copy(cl);
+  mesh.localToWorld(_pickV);
+
+  _snapTargetCenter.copy(_snapPreWorld);
+  snapWorldPointToGrid(_snapTargetCenter);
+
+  _snapScratch.copy(_pickV);
+  snapWorldPointToGrid(_snapScratch);
+
+  const oy = _snapPreWorld.y + (_snapScratch.y - _pickV.y);
+  _meshWorld.set(_snapTargetCenter.x, oy, _snapTargetCenter.z);
+
+  const SNAP_RELEASE_EPS = 1e-6;
+  if (_meshWorld.distanceToSquared(_snapPreWorld) < SNAP_RELEASE_EPS * SNAP_RELEASE_EPS) return;
+
+  mesh.position.copy(_meshWorld);
+  if (mesh.parent) mesh.parent.worldToLocal(mesh.position);
+}
+
+/** Drop cached stroke centers so lattice snap uses current geometry (cluster + child meshes). */
+function invalidateStrokeRootCenterCacheForGrab(root) {
+  if (!root) return;
+  delete root.userData.centerLocal;
+  invalidateStrokeClusterCenters(root);
+  if (root.isGroup && root.userData && root.userData.isStrokeCluster) {
+    for (const ch of root.children) {
+      if (ch.isMesh) delete ch.userData.centerLocal;
+    }
   }
 }
 
-/** New grab while snap is on: align root to lattice once, then offset = origin − ref (same frame). */
+/**
+ * While snap is on: refresh grab offset from mesh origin only — translate-only snap is deferred to
+ * the drag loop so the stroke does not jump off the finger on grab start.
+ */
 function snapGrabbedRootAtGrabStart(root, refWorldPos) {
   if (!snapToGridEnabled || !root) return;
-  _grabRefSnap.copy(refWorldPos);
-  snapMeshStrokeToGrid(root);
+  invalidateStrokeRootCenterCacheForGrab(root);
   strokesGroup.updateMatrixWorld(true);
   root.getWorldPosition(_meshWorld);
-  grabOffsetWorld.copy(_meshWorld).sub(_grabRefSnap);
-}
-
-/** After snap moves the mesh, resync grab offset so the next frame uses stylus + correct offset. */
-function refreshGrabOffsetAfterSnapStylus() {
-  if (!grabbedMesh || !stylus) return;
-  strokesGroup.updateMatrixWorld(true);
-  grabbedMesh.updateMatrixWorld(true);
-  grabbedMesh.getWorldPosition(_meshWorld);
-  grabOffsetWorld.copy(_meshWorld).sub(stylus.position);
-}
-
-function refreshGrabOffsetAfterSnapIndex(indexTipWorld) {
-  if (!grabbedMesh) return;
-  strokesGroup.updateMatrixWorld(true);
-  grabbedMesh.updateMatrixWorld(true);
-  grabbedMesh.getWorldPosition(_meshWorld);
-  grabOffsetWorld.copy(_meshWorld).sub(indexTipWorld);
+  grabOffsetWorld.copy(_meshWorld).sub(refWorldPos);
+  if (typeof window !== "undefined" && window.__mxInkGrabDebug) {
+    console.debug("[mxink grab start]", { deferredSnap: true, grabOffsetLen: grabOffsetWorld.length() });
+  }
 }
 
 function updateGridDotsInkUniform() {
@@ -1368,31 +2944,142 @@ function wireGridCellSlider() {
   });
 }
 
+function initStrokeWidthFromStorage() {
+  const slider = document.getElementById("stroke-width-slider");
+  if (!slider) return;
+  try {
+    const raw = localStorage.getItem(STROKE_WIDTH_MAX_STORAGE_KEY);
+    if (raw != null) {
+      const v = parseFloat(raw);
+      if (Number.isFinite(v) && v >= STROKE_WIDTH_MIN && v <= STROKE_WIDTH_MAX) {
+        userStrokeWidthMax = v;
+        slider.value = String(v);
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  const valEl = document.getElementById("stroke-width-value");
+  if (valEl) valEl.textContent = userStrokeWidthMax.toFixed(3);
+}
+
+function persistStrokeWidthMax() {
+  try {
+    localStorage.setItem(STROKE_WIDTH_MAX_STORAGE_KEY, String(userStrokeWidthMax));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function wireStrokeWidthSlider() {
+  const slider = document.getElementById("stroke-width-slider");
+  const valEl = document.getElementById("stroke-width-value");
+  if (!slider || !valEl) return;
+  valEl.textContent = userStrokeWidthMax.toFixed(3);
+  slider.addEventListener("input", () => {
+    const t = parseFloat(slider.value);
+    if (!Number.isFinite(t)) return;
+    userStrokeWidthMax = Math.min(
+      STROKE_WIDTH_MAX,
+      Math.max(STROKE_WIDTH_MIN + 1e-6, t),
+    );
+    valEl.textContent = userStrokeWidthMax.toFixed(3);
+    persistStrokeWidthMax();
+  });
+}
+
 /**
- * Axis-aligned steps from p0Ref toward p1 (both on grid). Keeps tube segments on grid edges only.
- * Updates p0Ref to p1 when done.
+ * Reduce perpendicular stair-steps from hand jitter: lock non-dominant axes until movement exceeds
+ * half a cell on that axis (dominant axis = largest |Δ| from last snapped vertex).
+ * Uses `sceneContentRoot` local axes so behavior stays correct when the world is rotated.
+ */
+function applyDraftSnapConstraint(out, lastWorld, snappedWorld) {
+  const cell = gridCellSize();
+  const half = cell * 0.5;
+  sceneContentRoot.updateMatrixWorld(true);
+  _draftSnapLocalLast.copy(lastWorld);
+  sceneContentRoot.worldToLocal(_draftSnapLocalLast);
+  _draftSnapLocalNext.copy(snappedWorld);
+  sceneContentRoot.worldToLocal(_draftSnapLocalNext);
+
+  const lx = _draftSnapLocalLast.x;
+  const ly = _draftSnapLocalLast.y;
+  const lz = _draftSnapLocalLast.z;
+  const sx = _draftSnapLocalNext.x;
+  const sy = _draftSnapLocalNext.y;
+  const sz = _draftSnapLocalNext.z;
+  const dx = Math.abs(sx - lx);
+  const dy = Math.abs(sy - ly);
+  const dz = Math.abs(sz - lz);
+  if (dx < 1e-9 && dy < 1e-9 && dz < 1e-9) {
+    out.copy(lastWorld);
+    return;
+  }
+  let dom = 0;
+  if (dy > dx && dy >= dz) dom = 1;
+  else if (dz > dx && dz > dy) dom = 2;
+  else if (dx >= dy && dx >= dz) dom = 0;
+  else if (dy >= dz) dom = 1;
+  else dom = 2;
+
+  _draftSnapLocalNext.set(sx, sy, sz);
+  if (dom !== 0 && dx < half) _draftSnapLocalNext.x = lx;
+  if (dom !== 1 && dy < half) _draftSnapLocalNext.y = ly;
+  if (dom !== 2 && dz < half) _draftSnapLocalNext.z = lz;
+
+  out.copy(_draftSnapLocalNext);
+  sceneContentRoot.localToWorld(out);
+}
+
+/**
+ * Axis-aligned steps from p0Ref toward p1 (both on grid, world space). Segments follow **grid**
+ * axes (`sceneContentRoot` local X/Y/Z), not world Cartesian — required when the scene is rotated.
  */
 function emitManhattanSnapSegments(painter, strokeWidth, p0Ref, p1) {
   const eps = 1e-6;
-  let x = p0Ref.x;
-  let y = p0Ref.y;
-  let z = p0Ref.z;
-  const step = (nx, ny, nz) => {
+  sceneContentRoot.updateMatrixWorld(true);
+  _manhLocalA.copy(p0Ref);
+  sceneContentRoot.worldToLocal(_manhLocalA);
+  _manhLocalB.copy(p1);
+  sceneContentRoot.worldToLocal(_manhLocalB);
+
+  let x = _manhLocalA.x;
+  let y = _manhLocalA.y;
+  let z = _manhLocalA.z;
+  const tx = _manhLocalB.x;
+  const ty = _manhLocalB.y;
+  const tz = _manhLocalB.z;
+
+  const emitStep = (nx, ny, nz) => {
     if (Math.abs(nx - x) < eps && Math.abs(ny - y) < eps && Math.abs(nz - z) < eps) return;
     _manhSeg.set(nx, ny, nz);
+    sceneContentRoot.localToWorld(_manhSeg);
     strokeMeshLocalFromWorld(_strokeMeshLocal, _manhSeg);
     painter.setSize(strokeWidth);
     painter.mesh.userData.strokeWidth = strokeWidth;
     painter.lineTo(_strokeMeshLocal);
     painter.update();
-    appendStrokePointWorld(_manhSeg);
+    appendStrokePointWorld(_manhSeg, strokeWidth);
     x = nx;
     y = ny;
     z = nz;
   };
-  if (Math.abs(p1.x - x) > eps) step(p1.x, y, z);
-  if (Math.abs(p1.y - y) > eps) step(x, p1.y, z);
-  if (Math.abs(p1.z - z) > eps) step(x, y, p1.z);
+  const dabs = [
+    Math.abs(tx - x),
+    Math.abs(ty - y),
+    Math.abs(tz - z),
+  ];
+  const axOrder = [0, 1, 2].sort((a, b) => {
+    const da = dabs[a];
+    const db = dabs[b];
+    if (db !== da) return db - da;
+    return a - b;
+  });
+  for (const ax of axOrder) {
+    if (ax === 0 && Math.abs(tx - x) > eps) emitStep(tx, y, z);
+    else if (ax === 1 && Math.abs(ty - y) > eps) emitStep(x, ty, z);
+    else if (ax === 2 && Math.abs(tz - z) > eps) emitStep(x, y, tz);
+  }
   p0Ref.copy(p1);
 }
 
@@ -1409,28 +3096,50 @@ function strokeMeshLocalFromWorld(out, worldVec) {
   return out;
 }
 
-function appendStrokePointWorld(worldVec) {
+function appendStrokePointWorld(worldVec, width) {
   if (!currentStrokePainter) return;
   strokeMeshLocalFromWorld(_pickV, worldVec);
   currentStrokePointsLocal.push(_pickV.clone());
+  const w =
+    typeof width === "number" && Number.isFinite(width)
+      ? width
+      : (STROKE_WIDTH_MIN + userStrokeWidthMax) * 0.5;
+  currentStrokeWidthsLocal.push(w);
 }
 
 function beginStroke(worldPoint) {
+  const startW = getPressureStrokeWidth();
   if (!currentStrokePainter) {
-    currentStrokePainter = new TubePainter();
-    currentStrokePainter.mesh.material = material;
-    const w = getPressureStrokeWidth();
-    currentStrokePainter.setSize(w);
-    currentStrokePainter.mesh.userData.strokeWidth = w;
-    strokesGroup.add(currentStrokePainter.mesh);
+    if (snapToGridEnabled) {
+      currentStrokePainter = createGridBoxStrokePainter(
+        computeGridBoxStrokeMaxVertices(STROKE_MAX_POINTS),
+      );
+      {
+        const m = getStrokeMaterialForHex(activeStrokeColorHex).clone();
+        m.flatShading = true;
+        currentStrokePainter.mesh.material = m;
+      }
+      currentStrokePainter.setSize(startW);
+      currentStrokePainter.mesh.userData.strokeWidth = startW;
+      currentStrokePainter.mesh.userData.strokeProfile = "square";
+      strokesGroup.add(currentStrokePainter.mesh);
+    } else {
+      currentStrokePainter = new TubePainter();
+      currentStrokePainter.mesh.material =
+        getStrokeMaterialForHex(activeStrokeColorHex);
+      currentStrokePainter.setSize(startW);
+      currentStrokePainter.mesh.userData.strokeWidth = startW;
+      strokesGroup.add(currentStrokePainter.mesh);
+    }
     currentStrokePointsLocal = [];
+    currentStrokeWidthsLocal = [];
   }
   _snapScratch.copy(worldPoint);
   if (snapToGridEnabled) snapWorldPointToGrid(_snapScratch);
   _lastStrokeSnapWorld.copy(_snapScratch);
   strokeMeshLocalFromWorld(_strokeMeshLocal, _snapScratch);
   currentStrokePainter.moveTo(_strokeMeshLocal);
-  appendStrokePointWorld(_snapScratch);
+  appendStrokePointWorld(_snapScratch, startW);
   _lastStrokeSampleWorld.copy(_snapScratch);
 }
 
@@ -1500,16 +3209,30 @@ function init() {
   const gltfLoader = new GLTFLoader();
   gltfLoader.setDRACOLoader(dracoLoader);
 
+  void preloadPresenceHeadModel(SKETCHAR_PRESENCE_HEAD_GLB_URL)
+    .then(() => {
+      refreshPresenceVisualsFromStoredPayload(sketcharRemotePeers);
+    })
+    .catch(() => {});
+  void preloadPresenceStylusModel(SKETCHAR_PRESENCE_STYLUS_GLB_URL)
+    .then(() => {
+      refreshPresenceVisualsFromStoredPayload(sketcharRemotePeers);
+    })
+    .catch(() => {});
+
   grid3dGroupRef = new THREE.Group();
   grid3dGroupRef.name = "grid-3d";
   grid3dGroupRef.visible = snapToGridEnabled;
   sceneContentRoot.add(strokesGroup);
   sceneContentRoot.add(grid3dGroupRef);
   sceneContentRoot.add(remotePresenceGroup);
+  initOriginGizmoAndFloor();
   scene.add(sceneContentRoot);
   initGridLatticeFromSliderDom();
   rebuildGrid3dVisuals();
   wireGridCellSlider();
+  initStrokeWidthFromStorage();
+  wireStrokeWidthSlider();
   persistGridLatticeDivisions();
 
   scene.add(new THREE.HemisphereLight(0x888877, 0x777788, 3));
@@ -1539,6 +3262,7 @@ function init() {
       if (def.joint === "pinky-finger-tip") {
         if (handName === "left") {
           label = makeLucideFingerSprite(Boxes, "boxes");
+          if (label) leftPinkyFingerSprite = label;
         } else {
           label = makeLucideFingerSprite(Grid3x3, "grid-3x3");
           if (label) {
@@ -1548,7 +3272,11 @@ function init() {
         }
       } else if (def.joint === "ring-finger-tip") {
         label = makeFingerLabelSprite(def.label);
-      } else if (handName === "left" && def.joint === "index-finger-tip") {
+        if (label && handName === "left") leftRingFingerSprite = label;
+      } else if (
+        (handName === "left" || handName === "right") &&
+        def.joint === "index-finger-tip"
+      ) {
         label = makeLucideFingerSprite(Axis3d, "axis3d");
       } else {
         label = makeFingerLabelSprite(def.label);
@@ -1564,7 +3292,20 @@ function init() {
   }
   addHandFingerMarkers(leftFingerDebugGroups, "left");
   addHandFingerMarkers(rightFingerDebugGroups, "right");
+  pickStrokeDebugLeft = createPickStrokeDebugHandGroup();
+  pickStrokeDebugLeft.name = "pick-stroke-debug-left";
+  pickStrokeDebugLeft.visible = false;
+  scene.add(pickStrokeDebugLeft);
+  pickStrokeDebugRight = createPickStrokeDebugHandGroup();
+  pickStrokeDebugRight.name = "pick-stroke-debug-right";
+  pickStrokeDebugRight.visible = false;
+  scene.add(pickStrokeDebugRight);
+  pickStrokeDebugStylus = createPickStrokeDebugStylusGroup();
+  pickStrokeDebugStylus.name = "pick-stroke-debug-stylus";
+  pickStrokeDebugStylus.visible = false;
+  scene.add(pickStrokeDebugStylus);
   lastRingSnapSpriteState = null;
+  lastLeftStylusGrabFingerMode = "default";
   updateRingGridSnapIndicatorSprites();
 
   renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
@@ -1573,8 +3314,25 @@ function init() {
   renderer.setAnimationLoop(animate);
   renderer.xr.enabled = true;
   document.body.appendChild(
-    XRButton.createButton(renderer, { optionalFeatures: ["unbounded", "hand-tracking"] }),
+    XRButton.createButton(renderer, {
+      optionalFeatures: ["unbounded", "hand-tracking", "depth-sensing"],
+    }),
   );
+  const xrEnterBtn = document.getElementById("XRButton");
+  if (xrEnterBtn) {
+    xrEnterBtn.style.display = "none";
+    xrEnterBtn.setAttribute("aria-hidden", "true");
+  }
+
+  renderer.xr.addEventListener("sessionstart", () => {
+    if (typeof window !== "undefined") window.__sketcharXRDepthSensing = false;
+    setupSketcharWristXR();
+    setupPalmMenuXR();
+  });
+  renderer.xr.addEventListener("sessionend", () => {
+    if (typeof window !== "undefined") window.__sketcharXRDepthSensing = false;
+    teardownSketcharWristXR();
+  });
 
   const controllerModelFactory = new XRControllerModelFactory();
 
@@ -1595,6 +3353,21 @@ function init() {
   controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
   scene.add(controllerGrip2);
   scene.add(controller2);
+
+  controller3 = renderer.xr.getController(2);
+  controller3.addEventListener("connected", onControllerConnected);
+  controller3.addEventListener("selectstart", onSelectStart);
+  controller3.addEventListener("selectend", onSelectEnd);
+  scene.add(controller3);
+
+  controller4 = renderer.xr.getController(3);
+  controller4.addEventListener("connected", onControllerConnected);
+  controller4.addEventListener("selectstart", onSelectStart);
+  controller4.addEventListener("selectend", onSelectEnd);
+  scene.add(controller4);
+
+  xrWristUiControllers.length = 0;
+  xrWristUiControllers.push(controller1, controller2, controller3, controller4);
 
   initSketcharUI();
 }
@@ -1668,11 +3441,17 @@ function sameGrabTarget(a, b) {
   return getStrokeGrabRoot(a) === getStrokeGrabRoot(b);
 }
 
-function pickStrokeMesh(origin, direction) {
+/** Single best target for erase / legacy callers (closest proximity if no ray hit). */
+function pickStrokeMeshFirst(origin, direction) {
   raycaster.set(origin, direction);
-  raycaster.far = 10;
+  raycaster.far = PICK_RAY_MAX_DIST;
   const hits = raycaster.intersectObjects(strokesGroup.children, true);
-  if (hits.length > 0) return hits[0].object;
+  if (hits.length > 0) {
+    if (typeof window !== "undefined" && window.__mxInkGrabDebug) {
+      console.debug("[mxink pick]", { via: "ray", rayDist: hits[0].distance });
+    }
+    return hits[0].object;
+  }
 
   let best = null;
   let bestDist = Infinity;
@@ -1693,7 +3472,64 @@ function pickStrokeMesh(origin, direction) {
       bestDist = d;
     }
   });
+  if (typeof window !== "undefined" && window.__mxInkGrabDebug) {
+    console.debug("[mxink pick]", {
+      via: best ? "proximity" : "none",
+      proximityDist: best ? bestDist : null,
+    });
+  }
   return best;
+}
+
+/**
+ * All stroke grab roots along the ray (in hit order) or within proximity (closest first).
+ * Eraser still uses `pickStrokeMesh` (first/closest only).
+ */
+function pickStrokeRoots(origin, direction) {
+  const seen = new Set();
+  const out = [];
+  const addFromObj = (obj) => {
+    const r = getStrokeGrabRoot(obj);
+    if (!seen.has(r)) {
+      seen.add(r);
+      out.push(r);
+    }
+  };
+
+  raycaster.set(origin, direction);
+  raycaster.far = PICK_RAY_MAX_DIST;
+  const hits = raycaster.intersectObjects(strokesGroup.children, true);
+  for (let i = 0; i < hits.length; i++) {
+    addFromObj(hits[i].object);
+  }
+  if (out.length > 0) return out;
+
+  const candidates = [];
+  strokesGroup.traverse((mesh) => {
+    if (!mesh.isMesh || !mesh.geometry) return;
+    if (mesh.isInstancedMesh) {
+      if (mesh.boundingSphere === null) mesh.computeBoundingSphere();
+      _pickSphere.copy(mesh.boundingSphere);
+    } else {
+      updateStrokeBoundingSphereFromDrawRange(mesh);
+      if (!mesh.geometry.boundingSphere) return;
+      _pickSphere.copy(mesh.geometry.boundingSphere);
+    }
+    _pickSphere.applyMatrix4(mesh.matrixWorld);
+    const d = _pickSphere.distanceToPoint(origin);
+    if (d < PICK_PROXIMITY_MAX_DIST) {
+      candidates.push({ mesh, d });
+    }
+  });
+  candidates.sort((a, b) => a.d - b.d);
+  for (let i = 0; i < candidates.length; i++) {
+    addFromObj(candidates[i].mesh);
+  }
+  return out;
+}
+
+function pickStrokeMesh(origin, direction) {
+  return pickStrokeMeshFirst(origin, direction);
 }
 
 function pickStrokeMeshFromStylusTip() {
@@ -1701,6 +3537,44 @@ function pickStrokeMeshFromStylusTip() {
   stylus.getWorldQuaternion(_quat);
   _rayDir.set(0, 0, -1).applyQuaternion(_quat).normalize();
   return pickStrokeMesh(stylus.position, _rayDir);
+}
+
+function pickStrokeRootsFromStylusTip() {
+  if (!stylus) return [];
+  stylus.getWorldQuaternion(_quat);
+  _rayDir.set(0, 0, -1).applyQuaternion(_quat).normalize();
+  return pickStrokeRoots(stylus.position, _rayDir);
+}
+
+function pickMatchesGrabSelection(picked) {
+  if (!picked) return false;
+  const r = getStrokeGrabRoot(picked);
+  if (grabbedGrabRoots.length > 0) return grabbedGrabRoots.includes(r);
+  return grabbedMesh && r === grabbedMesh;
+}
+
+function beginOneHandGrabWithRoots(roots, refPos, inputSource, isStylus) {
+  grabbedGrabRoots.length = 0;
+  grabbedOneHandEntries.length = 0;
+  for (let i = 0; i < roots.length; i++) {
+    const root = roots[i];
+    grabbedGrabRoots.push(root);
+    if (snapToGridEnabled) invalidateStrokeRootCenterCacheForGrab(root);
+  }
+  strokesGroup.updateMatrixWorld(true);
+  for (let i = 0; i < roots.length; i++) {
+    const root = roots[i];
+    root.getWorldPosition(_meshWorld);
+    grabbedOneHandEntries.push({
+      root,
+      offsetWorld: new THREE.Vector3().copy(_meshWorld).sub(refPos),
+    });
+  }
+  grabbedMesh = roots[0];
+  grabOffsetWorld.copy(grabbedOneHandEntries[0].offsetWorld);
+  grabInputSource = inputSource ?? null;
+  grabInputIsStylus = isStylus;
+  grabMode = "one";
 }
 
 function updateFingerDebugGroups(frame, session, refSpace, groups, handedness) {
@@ -1738,7 +3612,173 @@ function updateFingerDebug(frame, session) {
   updateFingerDebugGroups(frame, session, refSpace, rightFingerDebugGroups, "right");
 }
 
+function createPickStrokeDebugHandGroup() {
+  const g = new THREE.Group();
+  g.name = "pick-stroke-debug-hand";
+  g.renderOrder = 4;
+  const sphere = new THREE.Mesh(
+    new THREE.SphereGeometry(PICK_RAY_MAX_DIST, 20, 14),
+    new THREE.MeshBasicMaterial({
+      color: 0x44ddaa,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.38,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  sphere.raycast = () => {};
+  g.add(sphere);
+  const rayGeom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -PICK_RAY_MAX_DIST),
+  ]);
+  const line = new THREE.Line(
+    rayGeom,
+    new THREE.LineBasicMaterial({
+      color: 0x44ffcc,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  line.raycast = () => {};
+  g.add(line);
+  return g;
+}
+
+function createPickStrokeDebugStylusGroup() {
+  const g = new THREE.Group();
+  g.name = "pick-stroke-debug-stylus-inner";
+  g.renderOrder = 4;
+  const sphere = new THREE.Mesh(
+    new THREE.SphereGeometry(PICK_RAY_MAX_DIST, 20, 14),
+    new THREE.MeshBasicMaterial({
+      color: 0xff8844,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.42,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  sphere.raycast = () => {};
+  g.add(sphere);
+  const rayGeom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -PICK_RAY_MAX_DIST),
+  ]);
+  const line = new THREE.Line(
+    rayGeom,
+    new THREE.LineBasicMaterial({
+      color: 0xffaa66,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: true,
+      toneMapped: false,
+    }),
+  );
+  line.raycast = () => {};
+  g.add(line);
+  g.userData.sphereMat = sphere.material;
+  g.userData.lineMat = line.material;
+  return g;
+}
+
+/** Colors: free transform (warm) vs grid snap (cool) — pick distance is identical (`pickStrokeMeshFromStylusTip`). */
+function applyPickStrokeDebugStylusModeColors(group) {
+  const sm = group.userData.sphereMat;
+  const lm = group.userData.lineMat;
+  if (!sm || !lm) return;
+  if (snapToGridEnabled) {
+    sm.color.setHex(0x44aaff);
+    lm.color.setHex(0x88ccff);
+  } else {
+    sm.color.setHex(0xff8844);
+    lm.color.setHex(0xffaa66);
+  }
+}
+
+function updatePickStrokeDebugStylus() {
+  if (!pickStrokeDebugStylus) return;
+  if (!showPickStrokeDebug || !renderer?.xr?.isPresenting) {
+    pickStrokeDebugStylus.visible = false;
+    return;
+  }
+  if (!stylus) {
+    pickStrokeDebugStylus.visible = false;
+    return;
+  }
+  pickStrokeDebugStylus.position.copy(stylus.position);
+  stylus.getWorldQuaternion(pickStrokeDebugStylus.quaternion);
+  applyPickStrokeDebugStylusModeColors(pickStrokeDebugStylus);
+  pickStrokeDebugStylus.visible = true;
+}
+
+function updatePickStrokeDebugGroups(frame, session, refSpace, group, handedness) {
+  if (!group) return;
+  if (!showPickStrokeDebug) {
+    group.visible = false;
+    return;
+  }
+  let src = null;
+  for (const inputSource of session.inputSources) {
+    if (inputSource.hand && inputSource.handedness === handedness) {
+      src = inputSource;
+      break;
+    }
+  }
+  if (!src) {
+    group.visible = false;
+    return;
+  }
+  const hand = src.hand;
+  const indexTip = hand.get("index-finger-tip");
+  if (!indexTip) {
+    group.visible = false;
+    return;
+  }
+  const pose = frame.getPose(indexTip, refSpace);
+  if (!pose) {
+    group.visible = false;
+    return;
+  }
+  const p = pose.transform.position;
+  const o = pose.transform.orientation;
+  group.position.set(p.x, p.y, p.z);
+  group.quaternion.set(o.x, o.y, o.z, o.w);
+  group.visible = true;
+}
+
+function updatePickStrokeDebug(frame, session) {
+  if (!renderer?.xr?.isPresenting) {
+    if (pickStrokeDebugLeft) pickStrokeDebugLeft.visible = false;
+    if (pickStrokeDebugRight) pickStrokeDebugRight.visible = false;
+    if (pickStrokeDebugStylus) pickStrokeDebugStylus.visible = false;
+    return;
+  }
+  const refSpace = renderer.xr.getReferenceSpace();
+  if (!refSpace) return;
+  updatePickStrokeDebugGroups(frame, session, refSpace, pickStrokeDebugLeft, "left");
+  updatePickStrokeDebugGroups(frame, session, refSpace, pickStrokeDebugRight, "right");
+  updatePickStrokeDebugStylus();
+}
+
 function releaseGrab() {
+  const roots = grabbedGrabRoots.length > 0 ? grabbedGrabRoots.slice() : grabbedMesh ? [grabbedMesh] : [];
+  if (snapToGridEnabled) {
+    for (let i = 0; i < roots.length; i++) {
+      const root = roots[i];
+      if (root && root.parent) {
+        invalidateStrokeRootCenterCacheForGrab(root);
+        snapMeshStrokeToGridReleaseHybrid(root);
+      }
+    }
+    strokesGroup.updateMatrixWorld(true);
+  }
+  grabbedGrabRoots.length = 0;
+  grabbedOneHandEntries.length = 0;
   grabbedMesh = null;
   grabInputSource = null;
   grabInputIsStylus = false;
@@ -1746,6 +3786,197 @@ function releaseGrab() {
   grabMode = "none";
   twoGrabLeft = null;
   twoGrabRight = null;
+  /* Push was deferred while grabMode !== "none" (see shouldDeferSketcharSceneApply). */
+  scheduleSketcharPush();
+}
+
+function updateLeftHandStylusGrabFingerAffordances() {
+  const want = !!(grabInputIsStylus && grabMode === "one");
+  const mode = want ? "stylusGrab" : "default";
+  if (mode === lastLeftStylusGrabFingerMode) return;
+  lastLeftStylusGrabFingerMode = mode;
+  if (!leftRingFingerSprite || !leftPinkyFingerSprite) return;
+  if (mode === "stylusGrab") {
+    paintLucideSpriteTexture(leftRingFingerSprite, Copy, {
+      bgFill: "rgba(0,72,56,0.88)",
+      borderStroke: "rgba(140,255,190,0.95)",
+    });
+    leftRingFingerSprite.scale.set(0.011, 0.011, 0.011);
+    paintLucideSpriteTexture(leftPinkyFingerSprite, Trash2, {
+      bgFill: "rgba(72,24,0,0.88)",
+      borderStroke: "rgba(255,180,140,0.95)",
+    });
+  } else {
+    restoreLeftRingFingerSpriteDefault();
+    restoreLeftPinkyFingerSpriteDefault();
+    leftRingFingerSprite.scale.set(0.006, 0.006, 0.006);
+  }
+}
+
+/**
+ * @param {THREE.Sprite} sprite
+ * @param {unknown} iconNode
+ * @param {{ bgFill: string; borderStroke: string }} style
+ */
+function paintLucideSpriteTexture(sprite, iconNode, style) {
+  const tex = sprite.material.map;
+  const canvas = tex && tex.image;
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  if (canvas.width !== 72 || canvas.height !== 72) {
+    canvas.width = 72;
+    canvas.height = 72;
+  }
+  paintLucideFingerSpriteCanvas(ctx, 72, iconNode, style);
+  tex.needsUpdate = true;
+}
+
+function restoreLeftRingFingerSpriteDefault() {
+  if (!leftRingFingerSprite) return;
+  const s = makeFingerLabelSprite("R");
+  if (!s) return;
+  const newMap = s.material.map;
+  const old = leftRingFingerSprite.material.map;
+  leftRingFingerSprite.material.map = newMap;
+  leftRingFingerSprite.material.needsUpdate = true;
+  s.material.map = null;
+  s.material.dispose();
+  if (old) old.dispose();
+}
+
+function restoreLeftPinkyFingerSpriteDefault() {
+  if (!leftPinkyFingerSprite) return;
+  const s = makeLucideFingerSprite(Boxes, "boxes");
+  if (!s) return;
+  const newMap = s.material.map;
+  const old = leftPinkyFingerSprite.material.map;
+  leftPinkyFingerSprite.material.map = newMap;
+  leftPinkyFingerSprite.material.needsUpdate = true;
+  s.material.map = null;
+  s.material.dispose();
+  if (old) old.dispose();
+}
+
+function duplicateGrabbedStrokeRoot() {
+  const roots = grabbedGrabRoots.length > 0 ? grabbedGrabRoots.slice() : grabbedMesh ? [grabbedMesh] : [];
+  if (roots.length === 0) return;
+  const baseOff = new THREE.Vector3(0.05, 0.05, 0.05);
+  for (let ri = 0; ri < roots.length; ri++) {
+    const root = roots[ri];
+    const parent = root.parent || strokesGroup;
+    const offset = baseOff.clone().multiplyScalar(ri + 1);
+    if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+      const g = new THREE.Group();
+      g.userData.isStrokeCluster = true;
+      g.userData.syncId = crypto.randomUUID();
+      sketcharPendingSyncIds.add(g.userData.syncId);
+      g.position.copy(root.position).add(offset);
+      g.quaternion.copy(root.quaternion);
+      g.scale.copy(root.scale);
+      for (const ch of root.children) {
+        if (!ch.isMesh || ch.isInstancedMesh || !ch.userData.points) continue;
+        const pts = ch.userData.points.map((p) => p.clone());
+        const chHex =
+          typeof ch.userData.strokeColorHex === "number" &&
+          Number.isFinite(ch.userData.strokeColorHex)
+            ? ch.userData.strokeColorHex >>> 0
+            : DEFAULT_STROKE_COLOR_HEX;
+        const nm = buildStrokeMeshFromPoints(
+          pts,
+          ch.userData.strokeWidth,
+          ch.userData.strokeWidths,
+          chHex,
+          ch.userData.strokeProfile,
+        );
+        nm.position.copy(ch.position);
+        nm.quaternion.copy(ch.quaternion);
+        nm.scale.copy(ch.scale);
+        nm.userData.syncId = crypto.randomUUID();
+        sketcharPendingSyncIds.add(nm.userData.syncId);
+        g.add(nm);
+      }
+      parent.add(g);
+      invalidateStrokeClusterCenters(g);
+    } else if (root.isMesh && root.userData.points && root.userData.points.length >= 2) {
+      const pts = root.userData.points.map((p) => p.clone());
+      const rootHex =
+        typeof root.userData.strokeColorHex === "number" &&
+        Number.isFinite(root.userData.strokeColorHex)
+          ? root.userData.strokeColorHex >>> 0
+          : DEFAULT_STROKE_COLOR_HEX;
+      const nm = buildStrokeMeshFromPoints(
+        pts,
+        root.userData.strokeWidth,
+        root.userData.strokeWidths,
+        rootHex,
+        root.userData.strokeProfile,
+      );
+      nm.position.copy(root.position).add(offset);
+      nm.quaternion.copy(root.quaternion);
+      nm.scale.copy(root.scale);
+      nm.userData.syncId = crypto.randomUUID();
+      sketcharPendingSyncIds.add(nm.userData.syncId);
+      parent.add(nm);
+      delete nm.userData.centerLocal;
+    }
+  }
+  scheduleSketcharPush();
+}
+
+function deleteGrabbedStrokeRoot() {
+  const roots = grabbedGrabRoots.length > 0 ? grabbedGrabRoots.slice() : grabbedMesh ? [grabbedMesh] : [];
+  if (roots.length === 0) return;
+  for (let ri = 0; ri < roots.length; ri++) {
+    const root = roots[ri];
+    if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+      recordSketcharDeletionForObject3D(root);
+      root.traverse((o) => {
+        if (o.isMesh && o.geometry) o.geometry.dispose();
+      });
+      root.removeFromParent();
+    } else {
+      removeStrokeMeshFromScene(root);
+    }
+  }
+  releaseGrab();
+  scheduleSketcharPush();
+}
+
+function handleStylusGrabAuxPinches(frame) {
+  if (!grabInputIsStylus || grabMode !== "one" || !grabbedMesh) return;
+  if (!frame || !renderer.xr.isPresenting) return;
+  const refSpace = renderer.xr.getReferenceSpace();
+  const session = renderer.xr.getSession();
+  if (!refSpace || !session) return;
+
+  for (const inputSource of session.inputSources) {
+    if (!inputSource.hand || inputSource.handedness !== "left") continue;
+    const hand = inputSource.hand;
+    const thumbTip = hand.get("thumb-tip");
+    const ringTip = hand.get("ring-finger-tip");
+    const pinkyTip = hand.get("pinky-finger-tip");
+    if (!thumbTip || !ringTip || !pinkyTip) continue;
+    const tp = frame.getPose(thumbTip, refSpace);
+    const rp = frame.getPose(ringTip, refSpace);
+    const pp = frame.getPose(pinkyTip, refSpace);
+    if (!tp || !rp || !pp) continue;
+    jointPositionFromPose(tp, _thumbTipPos);
+    jointPositionFromPose(rp, _pickV);
+    const dRing = _thumbTipPos.distanceTo(_pickV);
+    jointPositionFromPose(pp, _pinkyTipPos);
+    const dPinky = _thumbTipPos.distanceTo(_pinkyTipPos);
+
+    const wasRing = thumbRingDupPinchPrev.get(inputSource) === true;
+    const isRing = wasRing ? dRing < PINCH_OPEN_DIST : dRing < PINCH_CLOSE_DIST;
+    thumbRingDupPinchPrev.set(inputSource, isRing);
+    if (isRing && !wasRing) duplicateGrabbedStrokeRoot();
+
+    const wasDel = thumbPinkyDelPinchPrev.get(inputSource) === true;
+    const isDel = wasDel ? dPinky < PINCH_OPEN_DIST : dPinky < PINCH_CLOSE_DIST;
+    thumbPinkyDelPinchPrev.set(inputSource, isDel);
+    if (isDel && !wasDel) deleteGrabbedStrokeRoot();
+  }
 }
 
 /** Rear “pinch” when not drawing — grab / two-hand with the other hand. */
@@ -1847,6 +4078,24 @@ function updateSceneOneHandGrab(frame, refSpace, slot) {
   if (!getThumbMiddleAnchorWorldInto(frame, refSpace, slot.hand, sm_anchorScratch)) return;
   _snapDeltaWorld.copy(sm_anchorScratch).sub(sm_oneAnchor0);
   sceneContentRoot.position.copy(sceneOnePos0).add(_snapDeltaWorld);
+  if (snapToGridEnabled) {
+    sceneContentRoot.updateMatrixWorld(true);
+    _meshWorld.set(0, 0, 0);
+    sceneContentRoot.localToWorld(_meshWorld);
+    _snapScratch.copy(_meshWorld);
+    snapWorldPointToGrid(_snapScratch);
+    const parent = sceneContentRoot.parent;
+    if (parent) {
+      parent.updateMatrixWorld(true);
+      const aP = _meshWorld.clone();
+      parent.worldToLocal(aP);
+      const bP = _snapScratch.clone();
+      parent.worldToLocal(bP);
+      sceneContentRoot.position.add(bP.sub(aP));
+    } else {
+      sceneContentRoot.position.copy(_snapScratch);
+    }
+  }
 }
 
 function transitionSceneTwoToOne(slot, frame, refSpace) {
@@ -1976,6 +4225,7 @@ function updateSceneTwoHandGrab(frame, refSpace) {
   _meshWorld.add(_snapDeltaWorld);
   sceneContentRoot.position.copy(_meshWorld);
   if (sceneContentRoot.parent) sceneContentRoot.parent.worldToLocal(sceneContentRoot.position);
+  refreshAllStrokesTubeGeometryForWorldWidth();
 }
 
 function handleSceneManip(frame) {
@@ -2048,7 +4298,7 @@ function handleSceneManip(frame) {
       sceneOneSrc === L.inputSource &&
       lP &&
       !rP &&
-      stylusHandedness === "right" &&
+      (stylusHandedness === "right" || stylusHandedness === "left") &&
       stylusRearJustPressed &&
       isStylusGrabForManip()
     ) {
@@ -2097,7 +4347,7 @@ function handleSceneManip(frame) {
     L &&
     !L.wasPinched &&
     isStylusGrabForManip() &&
-    stylusHandedness === "right"
+    (stylusHandedness === "right" || stylusHandedness === "left")
   ) {
     initSceneTwoHandGrabWithStylus(frame, refSpace, L.inputSource, "right");
     return;
@@ -2157,6 +4407,9 @@ function leftRightSources(a, b) {
 
 function initTwoHandGrab(mesh, pL, pR, leftSrc, rightSrc, frame, refSpace) {
   if (!leftSrc && !rightSrc) return;
+  grabbedGrabRoots.length = 0;
+  grabbedGrabRoots.push(mesh);
+  grabbedOneHandEntries.length = 0;
   grabbedMesh = mesh;
   grabMode = "two";
   grabInputSource = null;
@@ -2363,7 +4616,7 @@ function updateTwoHandGrab(frame, refSpace) {
   thTargetCenter.copy(thMid).add(thOScaled);
 
   const centerLocal = ensureMeshCenterLocal(mesh);
-  // Pinch distance scales the mesh uniformly (stroke path and tube thickness).
+  // Pinch distance scales the mesh uniformly; tube thickness is rebuilt to stay constant in world space.
   mesh.scale.setScalar(thBaseScale * s);
   mesh.quaternion.copy(thQuatMesh0).premultiply(qAlign).premultiply(qTwist);
   mesh.position.set(0, 0, 0);
@@ -2376,14 +4629,13 @@ function updateTwoHandGrab(frame, refSpace) {
   _meshWorld.add(_snapDeltaWorld);
   mesh.position.copy(_meshWorld);
   if (mesh.parent) mesh.parent.worldToLocal(mesh.position);
-  snapGrabbedMeshStrokeToGrid(mesh);
-  if (snapToGridEnabled) {
-    strokesGroup.updateMatrixWorld(true);
-    mesh.updateMatrixWorld(true);
-    _pickV.copy(ensureMeshCenterLocal(mesh));
-    mesh.localToWorld(_pickV);
-    thO0.copy(_pickV).sub(thMid);
-  }
+  /* Lattice alignment on release only (releaseGrab); free transform while pinching. */
+  strokesGroup.updateMatrixWorld(true);
+  mesh.updateMatrixWorld(true);
+  _pickV.copy(ensureMeshCenterLocal(mesh));
+  mesh.localToWorld(_pickV);
+  thO0.copy(_pickV).sub(thMid);
+  refreshStrokeRootForWorldWidth(mesh);
 }
 
 function transitionTwoHandToOne(remainingSource, frame, refSpace) {
@@ -2399,6 +4651,13 @@ function transitionTwoHandToOne(remainingSource, frame, refSpace) {
   mesh.getWorldPosition(_meshWorld);
   grabOffsetWorld.copy(_meshWorld).sub(_indexTipPos);
   snapGrabbedRootAtGrabStart(mesh, _indexTipPos);
+  grabbedGrabRoots.length = 0;
+  grabbedGrabRoots.push(mesh);
+  grabbedOneHandEntries.length = 0;
+  grabbedOneHandEntries.push({
+    root: mesh,
+    offsetWorld: new THREE.Vector3().copy(grabOffsetWorld),
+  });
 }
 
 function transitionTwoHandToStylusOne(frame, refSpace) {
@@ -2413,6 +4672,13 @@ function transitionTwoHandToStylusOne(frame, refSpace) {
   mesh.getWorldPosition(_meshWorld);
   grabOffsetWorld.copy(_meshWorld).sub(stylus.position);
   snapGrabbedRootAtGrabStart(mesh, stylus.position);
+  grabbedGrabRoots.length = 0;
+  grabbedGrabRoots.push(mesh);
+  grabbedOneHandEntries.length = 0;
+  grabbedOneHandEntries.push({
+    root: mesh,
+    offsetWorld: new THREE.Vector3().copy(grabOffsetWorld),
+  });
 }
 
 function ensureMeshCenterLocal(mesh) {
@@ -2454,20 +4720,188 @@ function ensureMeshCenterLocal(mesh) {
   return mesh.userData.centerLocal;
 }
 
-function buildStrokeMeshFromPoints(pointsLocal, strokeWidth) {
-  const w = strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
-  const tp = createTubePainterSized(
-    computeTubePainterMaxVertices(pointsLocal.length),
-  );
-  tp.mesh.material = material;
-  tp.setSize(w);
-  tp.mesh.userData.strokeWidth = w;
-  tp.moveTo(pointsLocal[0]);
-  for (let i = 1; i < pointsLocal.length; i++) {
-    tp.lineTo(pointsLocal[i]);
+function buildStrokeMeshFromPoints(
+  pointsLocal,
+  strokeWidth,
+  strokeWidths,
+  strokeColorHex,
+  strokeProfile,
+) {
+  const fallback = strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
+  const hex =
+    typeof strokeColorHex === "number" && Number.isFinite(strokeColorHex)
+      ? strokeColorHex >>> 0
+      : DEFAULT_STROKE_COLOR_HEX;
+  const n = pointsLocal.length;
+  const square = strokeProfile === "square";
+  const useWidths =
+    Array.isArray(strokeWidths) &&
+    strokeWidths.length === n &&
+    strokeWidths.every((x) => typeof x === "number" && Number.isFinite(x));
+
+  if (square) {
+    const gp = createGridBoxStrokePainter(computeGridBoxStrokeMaxVertices(n));
+    {
+      const m = getStrokeMaterialForHex(hex).clone();
+      m.flatShading = true;
+      gp.mesh.material = m;
+    }
+    gp.mesh.userData.strokeColorHex = hex;
+    gp.mesh.userData.strokeProfile = "square";
+    if (useWidths) {
+      gp.moveTo(pointsLocal[0]);
+      for (let i = 1; i < n; i++) {
+        gp.setSize(strokeWidths[i]);
+        gp.mesh.userData.strokeWidth = strokeWidths[i];
+        gp.lineTo(pointsLocal[i]);
+      }
+      gp.mesh.userData.strokeWidths = strokeWidths.slice();
+    } else {
+      gp.setSize(fallback);
+      gp.mesh.userData.strokeWidth = fallback;
+      gp.moveTo(pointsLocal[0]);
+      for (let i = 1; i < n; i++) {
+        gp.lineTo(pointsLocal[i]);
+      }
+      gp.mesh.userData.strokeWidths = pointsLocal.map(() => fallback);
+    }
+    gp.update();
+    gp.mesh.userData.points = pointsLocal.map((p) => p.clone());
+    return gp.mesh;
+  }
+
+  const tp = createTubePainterSized(computeTubePainterMaxVertices(n));
+  tp.mesh.material = getStrokeMaterialForHex(hex);
+  tp.mesh.userData.strokeColorHex = hex;
+  if (useWidths) {
+    tp.moveTo(pointsLocal[0]);
+    for (let i = 1; i < n; i++) {
+      tp.setSize(strokeWidths[i]);
+      tp.mesh.userData.strokeWidth = strokeWidths[i];
+      tp.lineTo(pointsLocal[i]);
+    }
+    tp.mesh.userData.strokeWidths = strokeWidths.slice();
+  } else {
+    tp.setSize(fallback);
+    tp.mesh.userData.strokeWidth = fallback;
+    tp.moveTo(pointsLocal[0]);
+    for (let i = 1; i < n; i++) {
+      tp.lineTo(pointsLocal[i]);
+    }
+    tp.mesh.userData.strokeWidths = pointsLocal.map(() => fallback);
   }
   tp.update();
+  tp.mesh.userData.points = pointsLocal.map((p) => p.clone());
   return tp.mesh;
+}
+
+/**
+ * Product of uniform scale from `obj` through `sceneContentRoot` (inclusive).
+ * Stops at `sceneContentRoot` so we never multiply unrelated scene graph scales.
+ */
+function getStrokeWorldUniformScale(obj) {
+  let s = 1;
+  let o = obj;
+  while (o && o !== sceneContentRoot) {
+    s *= o.scale.x;
+    o = o.parent;
+  }
+  if (o === sceneContentRoot) s *= o.scale.x;
+  return Math.max(s, 1e-6);
+}
+
+/**
+ * Stroke material after rebuild: grid/box strokes need flat shading (cloned so cache is unchanged).
+ */
+function applyStrokeMaterialAfterRebuild(mesh, colorHex) {
+  const h =
+    typeof colorHex === "number" && Number.isFinite(colorHex)
+      ? colorHex >>> 0
+      : DEFAULT_STROKE_COLOR_HEX;
+  const m = getStrokeMaterialForHex(h).clone();
+  if (mesh.userData.strokeProfile === "square") m.flatShading = true;
+  mesh.material = m;
+  mesh.userData.strokeColorHex = h;
+}
+
+/**
+ * Rebuild tube geometry so world stroke width matches canonical `userData.strokeWidths`
+ * after hierarchy scale changes. Does not alter serialized/sync stroke width values.
+ */
+function refreshStrokeTubeGeometryForWorldWidth(mesh) {
+  if (!mesh || !mesh.isMesh || mesh.isInstancedMesh) return;
+  const pts = mesh.userData.points;
+  if (!pts || pts.length < 2) return;
+
+  const canonicalStrokeWidth =
+    mesh.userData.strokeWidth ??
+    (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
+  const canonicalWidths = mesh.userData.strokeWidths;
+  const widthsOk =
+    Array.isArray(canonicalWidths) &&
+    canonicalWidths.length === pts.length &&
+    canonicalWidths.every((x) => typeof x === "number" && Number.isFinite(x));
+
+  mesh.updateMatrixWorld(true);
+  const s = getStrokeWorldUniformScale(mesh);
+  const effectiveFallback = canonicalStrokeWidth / s;
+  const effectiveWidths = widthsOk
+    ? canonicalWidths.map((w) => w / s)
+    : null;
+
+  const localPts = pts.map((p) => p.clone());
+  const colorHex =
+    typeof mesh.userData.strokeColorHex === "number" &&
+    Number.isFinite(mesh.userData.strokeColorHex)
+      ? mesh.userData.strokeColorHex >>> 0
+      : DEFAULT_STROKE_COLOR_HEX;
+  const built = buildStrokeMeshFromPoints(
+    localPts,
+    effectiveFallback,
+    effectiveWidths,
+    colorHex,
+    mesh.userData.strokeProfile,
+  );
+
+  const oldG = mesh.geometry;
+  mesh.geometry = built.geometry;
+  built.geometry = null;
+  oldG.dispose();
+
+  mesh.userData.points = localPts.map((p) => p.clone());
+  if (widthsOk) {
+    mesh.userData.strokeWidths = canonicalWidths.slice();
+  } else {
+    mesh.userData.strokeWidths = pts.map(() => canonicalStrokeWidth);
+  }
+  mesh.userData.strokeWidth = canonicalStrokeWidth;
+  applyStrokeMaterialAfterRebuild(mesh, colorHex);
+  delete mesh.userData.centerLocal;
+  invalidateStrokeClusterCenters(mesh);
+  updateStrokeBoundingSphereFromDrawRange(mesh);
+}
+
+/** Stroke mesh or cluster group under `strokesGroup`. */
+function refreshStrokeRootForWorldWidth(root) {
+  if (!root) return;
+  if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+    for (const ch of root.children) {
+      if (ch.isMesh && ch.userData && ch.userData.points) {
+        refreshStrokeTubeGeometryForWorldWidth(ch);
+      }
+    }
+    return;
+  }
+  if (root.isMesh && root.userData && root.userData.points) {
+    refreshStrokeTubeGeometryForWorldWidth(root);
+  }
+}
+
+function refreshAllStrokesTubeGeometryForWorldWidth() {
+  strokesGroup.updateMatrixWorld(true);
+  for (const ch of strokesGroup.children) {
+    refreshStrokeRootForWorldWidth(ch);
+  }
 }
 
 function invalidateStrokeClusterCenters(node) {
@@ -2479,7 +4913,12 @@ function invalidateStrokeClusterCenters(node) {
 }
 
 function eraseStrokeAtWorld(mesh, eraseWorldPt) {
+  recordSketcharDeletionForObject3D(mesh);
   const pts = mesh.userData.points;
+  const strokeWidthsFull = mesh.userData.strokeWidths;
+  const widthsOk =
+    Array.isArray(strokeWidthsFull) &&
+    strokeWidthsFull.length === pts?.length;
   if (!pts || pts.length < 2) {
     const parent = mesh.parent;
     mesh.removeFromParent();
@@ -2500,6 +4939,8 @@ function eraseStrokeAtWorld(mesh, eraseWorldPt) {
   }
 
   const runs = [];
+  /** @type {number[][]} */
+  const runWidths = [];
   let start = -1;
   for (let i = 0; i < keep.length; i++) {
     if (keep[i]) {
@@ -2507,12 +4948,18 @@ function eraseStrokeAtWorld(mesh, eraseWorldPt) {
     } else {
       if (start >= 0 && i - start >= 2) {
         runs.push(pts.slice(start, i));
+        if (widthsOk) {
+          runWidths.push(strokeWidthsFull.slice(start, i));
+        }
       }
       start = -1;
     }
   }
   if (start >= 0 && keep.length - start >= 2) {
     runs.push(pts.slice(start));
+    if (widthsOk) {
+      runWidths.push(strokeWidthsFull.slice(start));
+    }
   }
 
   if (runs.length === 0) {
@@ -2537,13 +4984,32 @@ function eraseStrokeAtWorld(mesh, eraseWorldPt) {
 
   const sw = mesh.userData.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
   const addTo = eraseParent && eraseParent.userData && eraseParent.userData.isStrokeCluster ? eraseParent : strokesGroup;
-  for (const run of runs) {
+  for (let ri = 0; ri < runs.length; ri++) {
+    const run = runs[ri];
     const localPts = run.map((p) => p.clone());
-    const newMesh = buildStrokeMeshFromPoints(localPts, sw);
+    const rw =
+      widthsOk && runWidths[ri] && runWidths[ri].length === localPts.length
+        ? runWidths[ri]
+        : null;
+    const splitColorHex =
+      typeof mesh.userData.strokeColorHex === "number" &&
+      Number.isFinite(mesh.userData.strokeColorHex)
+        ? mesh.userData.strokeColorHex >>> 0
+        : DEFAULT_STROKE_COLOR_HEX;
+    const newMesh = buildStrokeMeshFromPoints(
+      localPts,
+      sw,
+      rw,
+      splitColorHex,
+      mesh.userData.strokeProfile,
+    );
     newMesh.position.copy(pos);
     newMesh.quaternion.copy(quat);
     newMesh.scale.copy(sc);
     newMesh.userData.points = localPts.map((p) => p.clone());
+    const splitId = crypto.randomUUID();
+    newMesh.userData.syncId = splitId;
+    sketcharPendingSyncIds.add(splitId);
     addTo.add(newMesh);
   }
   if (eraseParent && eraseParent.userData && eraseParent.userData.isStrokeCluster) {
@@ -2556,6 +5022,7 @@ function eraseStrokeAtWorld(mesh, eraseWorldPt) {
 function dissolveStrokeClusterIfSingleton(cluster) {
   if (!cluster.userData || !cluster.userData.isStrokeCluster) return;
   if (cluster.children.length === 0) {
+    recordSketcharDeletionForObject3D(cluster);
     cluster.removeFromParent();
     return;
   }
@@ -2563,6 +5030,7 @@ function dissolveStrokeClusterIfSingleton(cluster) {
   const ch = cluster.children[0];
   cluster.remove(ch);
   strokesGroup.add(ch);
+  recordSketcharDeletionForObject3D(cluster);
   cluster.removeFromParent();
   invalidateStrokeClusterCenters(ch);
 }
@@ -2578,9 +5046,10 @@ function handleEraseWithStylus() {
     eraseStrokeAtWorld(hit, _eraseWorld);
   } else {
     const parent = hit.parent;
+    recordSketcharDeletionForObject3D(hit);
     hit.removeFromParent();
     hit.geometry.dispose();
-    if (hit.material && hit.material !== material) hit.material.dispose();
+    /* Stroke materials are shared/cached — dispose geometry only. */
     if (parent && parent.userData && parent.userData.isStrokeCluster) {
       invalidateStrokeClusterCenters(parent);
       dissolveStrokeClusterIfSingleton(parent);
@@ -2602,6 +5071,60 @@ function meshIsUnderStrokesGroup(mesh) {
     p = p.parent;
   }
   return false;
+}
+
+function detachStrokeRootForUndo(root) {
+  if (!root) return;
+  recordSketcharDeletionForObject3D(root);
+  const parent = root.parent;
+  root.removeFromParent();
+  if (parent && parent.userData && parent.userData.isStrokeCluster) {
+    invalidateStrokeClusterCenters(parent);
+    dissolveStrokeClusterIfSingleton(parent);
+  }
+}
+
+function clearStrokeUndoStacks() {
+  strokeUndoStack.length = 0;
+  strokeRedoStack.length = 0;
+}
+
+function updateStrokeUndoRedoButtons() {
+  const u = document.getElementById("sketchar-undo");
+  const r = document.getElementById("sketchar-redo");
+  if (u) u.disabled = strokeUndoStack.length === 0;
+  if (r) r.disabled = strokeRedoStack.length === 0;
+}
+
+function undoLastStroke() {
+  while (strokeUndoStack.length > 0) {
+    const root = strokeUndoStack.pop();
+    if (!root || !meshIsUnderStrokesGroup(root)) continue;
+    detachStrokeRootForUndo(root);
+    strokeRedoStack.push(root);
+    scheduleSketcharPush();
+    updateStrokeUndoRedoButtons();
+    return;
+  }
+  updateStrokeUndoRedoButtons();
+}
+
+function redoLastStroke() {
+  if (strokeRedoStack.length === 0) {
+    updateStrokeUndoRedoButtons();
+    return;
+  }
+  const root = strokeRedoStack.pop();
+  const id =
+    root.userData && typeof root.userData.syncId === "string"
+      ? root.userData.syncId.trim()
+      : "";
+  if (id) sketcharDeletedSyncIds.delete(id);
+  strokesGroup.add(root);
+  strokesGroup.updateMatrixWorld(true);
+  strokeUndoStack.push(root);
+  scheduleSketcharPush();
+  updateStrokeUndoRedoButtons();
 }
 
 /**
@@ -2633,6 +5156,7 @@ function orthogonalizeEdges(ex, ey, ez, outUx, outUy, outUz) {
 
 function removeStrokeMeshFromScene(mesh) {
   if (!mesh) return;
+  recordSketcharDeletionForObject3D(mesh);
   const parent = mesh.parent;
   mesh.removeFromParent();
   mesh.geometry.dispose();
@@ -2719,7 +5243,7 @@ function tryBuildVoxelBlockFromLastThreeStrokes() {
   }
 
   const geom = new THREE.BoxGeometry(1, 1, 1);
-  const inst = new THREE.InstancedMesh(geom, material, count);
+  const inst = new THREE.InstancedMesh(geom, voxelMaterial, count);
   inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   inst.userData.isVoxelBlock = true;
   inst.frustumCulled = false;
@@ -2791,12 +5315,7 @@ function handleGridSnapTogglePinch(frame) {
     thumbPinkyPinchPrev.set(inputSource, isPinched);
 
     if (isPinched && !wasPinched) {
-      const next = !snapToGridEnabled;
-      snapToGridEnabled = next;
-      if (next) {
-        invalidateStrokeMeshCenterLocals();
-        snapAllStrokeRootsToGrid();
-      }
+      snapToGridEnabled = !snapToGridEnabled;
       return;
     }
   }
@@ -2807,6 +5326,9 @@ function handleBlockModePinch(frame) {
   if (!refSpace) return;
   const session = renderer.xr.getSession();
   if (!session) return;
+
+  /* Thumb+pinky on left is delete while rear-grabbing an object — block voxel affordance. */
+  if (grabInputIsStylus && grabMode !== "none") return;
 
   if (grabMode !== "none" || isDrawing || isStrokeActive()) return;
 
@@ -2846,6 +5368,9 @@ function handleHandGrab(frame) {
 
   const session = renderer.xr.getSession();
   if (!session) return;
+
+  /* Scene/world manip uses rear+stylus; do not compete with stroke grab in the same frame. */
+  if (sceneManipMode !== "none") return;
 
   scene.updateMatrixWorld(true);
 
@@ -2940,20 +5465,25 @@ function handleHandGrab(frame) {
       releaseGrab();
       return;
     }
-    _grabTargetWorld.copy(stylus.position).add(grabOffsetWorld);
-    const grabPar = grabbedMesh.parent;
-    if (grabPar) grabPar.worldToLocal(_grabTargetWorld);
-    else strokesGroup.worldToLocal(_grabTargetWorld);
-    grabbedMesh.position.copy(_grabTargetWorld);
-    snapGrabbedMeshStrokeToGrid(grabbedMesh, false);
-    if (snapToGridEnabled) refreshGrabOffsetAfterSnapStylus();
+    const entries =
+      grabbedOneHandEntries.length > 0
+        ? grabbedOneHandEntries
+        : [{ root: grabbedMesh, offsetWorld: grabOffsetWorld }];
+    for (let gi = 0; gi < entries.length; gi++) {
+      const { root, offsetWorld: offW } = entries[gi];
+      _grabTargetWorld.copy(stylus.position).add(offW);
+      const grabPar = root.parent;
+      if (grabPar) grabPar.worldToLocal(_grabTargetWorld);
+      else strokesGroup.worldToLocal(_grabTargetWorld);
+      root.position.copy(_grabTargetWorld);
+    }
 
     for (const hs of handStates) {
       if (!hs.isPinched || hs.wasPinched) continue;
       if (handGrabBlockedWhileDrawing(hs.inputSource)) continue;
       rayDirFromIndexTipPose(hs.indexPose);
       const picked = pickStrokeMesh(hs.indexPos, _rayDir);
-      if (!sameGrabTarget(picked, grabbedMesh)) continue;
+      if (!pickMatchesGrabSelection(picked)) continue;
       if (hs.inputSource.handedness === "left") {
         getIndexTipWorldInto(frame, refSpace, hs.hand, thPL);
         thPR.copy(stylus.position);
@@ -2978,13 +5508,29 @@ function handleHandGrab(frame) {
     }
 
     jointPositionFromPose(st.indexPose, _indexTipPos);
-    _grabTargetWorld.copy(_indexTipPos).add(grabOffsetWorld);
-    const grabParIdx = grabbedMesh.parent;
-    if (grabParIdx) grabParIdx.worldToLocal(_grabTargetWorld);
-    else strokesGroup.worldToLocal(_grabTargetWorld);
-    grabbedMesh.position.copy(_grabTargetWorld);
-    snapGrabbedMeshStrokeToGrid(grabbedMesh, false);
-    if (snapToGridEnabled) refreshGrabOffsetAfterSnapIndex(_indexTipPos);
+    const entries =
+      grabbedOneHandEntries.length > 0
+        ? grabbedOneHandEntries
+        : [{ root: grabbedMesh, offsetWorld: grabOffsetWorld }];
+    for (let gi = 0; gi < entries.length; gi++) {
+      const { root, offsetWorld: offW } = entries[gi];
+      _grabTargetWorld.copy(_indexTipPos).add(offW);
+      const grabParIdx = root.parent;
+      if (grabParIdx) grabParIdx.worldToLocal(_grabTargetWorld);
+      else strokesGroup.worldToLocal(_grabTargetWorld);
+      root.position.copy(_grabTargetWorld);
+    }
+    if (snapToGridEnabled) {
+      for (let gi = 0; gi < entries.length; gi++) {
+        snapMeshStrokeToGridTranslateOnly(entries[gi].root);
+      }
+      strokesGroup.updateMatrixWorld(true);
+      for (let gi = 0; gi < entries.length; gi++) {
+        const ent = entries[gi];
+        ent.root.getWorldPosition(_meshWorld);
+        ent.offsetWorld.copy(_meshWorld).sub(_indexTipPos);
+      }
+    }
 
     for (const hs of handStates) {
       if (hs.inputSource === grabInputSource) continue;
@@ -2992,7 +5538,7 @@ function handleHandGrab(frame) {
       if (handGrabBlockedWhileDrawing(hs.inputSource)) continue;
       rayDirFromIndexTipPose(hs.indexPose);
       const picked = pickStrokeMesh(hs.indexPos, _rayDir);
-      if (!sameGrabTarget(picked, grabbedMesh)) continue;
+      if (!pickMatchesGrabSelection(picked)) continue;
 
       const lr = leftRightSources(grabInputSource, hs.inputSource);
       if (!lr) continue;
@@ -3004,7 +5550,7 @@ function handleHandGrab(frame) {
 
     if (grabMode === "one" && grabbedMesh && grabInputSource && isStylusGrabForManip()) {
       const pickStylus = pickStrokeMeshFromStylusTip();
-      if (sameGrabTarget(pickStylus, grabbedMesh)) {
+      if (pickMatchesGrabSelection(pickStylus)) {
         if (grabInputSource.handedness === "left") {
           getIndexTipWorldInto(frame, refSpace, grabInputSource.hand, thPL);
           thPR.copy(stylus.position);
@@ -3067,37 +5613,37 @@ function handleHandGrab(frame) {
 
   for (const hs of starters) {
     rayDirFromIndexTipPose(hs.indexPose);
-    const picked = pickStrokeMesh(hs.indexPos, _rayDir);
-    if (picked) {
-      const root = getStrokeGrabRoot(picked);
-      grabbedMesh = root;
-      grabInputSource = hs.inputSource;
-      grabInputIsStylus = false;
-      grabMode = "one";
-      jointPositionFromPose(hs.indexPose, _indexTipPos);
-      root.getWorldPosition(_meshWorld);
-      grabOffsetWorld.copy(_meshWorld).sub(_indexTipPos);
-      snapGrabbedRootAtGrabStart(root, _indexTipPos);
-      break;
-    }
+    const roots = pickStrokeRoots(hs.indexPos, _rayDir);
+    if (roots.length === 0) continue;
+    jointPositionFromPose(hs.indexPose, _indexTipPos);
+    beginOneHandGrabWithRoots(roots, _indexTipPos, hs.inputSource, false);
+    break;
   }
 
-  if (grabMode === "none" && stylus && gamepad1 && isStylusGrabForManip()) {
-    const picked = pickStrokeMeshFromStylusTip();
-    if (picked) {
-      const root = getStrokeGrabRoot(picked);
-      grabbedMesh = root;
-      grabMode = "one";
-      grabInputIsStylus = true;
-      grabInputSource = null;
-      root.getWorldPosition(_meshWorld);
-      grabOffsetWorld.copy(_meshWorld).sub(stylus.position);
-      snapGrabbedRootAtGrabStart(root, stylus.position);
+  if (
+    grabMode === "none" &&
+    sceneManipMode === "none" &&
+    stylus &&
+    gamepad1 &&
+    isStylusGrabForManip()
+  ) {
+    const roots = pickStrokeRootsFromStylusTip();
+    if (roots.length > 0) {
+      beginOneHandGrabWithRoots(roots, stylus.position, null, true);
     }
   }
 }
 
 function animate(time, frame) {
+  if (renderer?.xr && !renderer.xr.isPresenting) {
+    if (pickStrokeDebugLeft) pickStrokeDebugLeft.visible = false;
+    if (pickStrokeDebugRight) pickStrokeDebugRight.visible = false;
+    if (pickStrokeDebugStylus) pickStrokeDebugStylus.visible = false;
+  }
+  if (renderer.xr.isPresenting && typeof window !== "undefined") {
+    window.__sketcharXRDepthSensing = renderer.xr.hasDepthSensing();
+  }
+  syncOriginGizmoVisibility();
   refreshMxInkGamepad();
   _eraserThisFrame = false;
 
@@ -3118,6 +5664,8 @@ function animate(time, frame) {
       CLUSTER_FRONT_ERASER_BTN_INDEX,
       CLUSTER_FRONT_ERASER_ACTIVATE
     );
+    /* Thumb+index pinch on stylus hand: prefer transform over accidental cluster_front (eraser). */
+    if (pinchBlocksPen) _eraserThisFrame = false;
 
     prevIsDrawing = isDrawing;
     const rawDraw = (midFirm || tipDraw) && !_eraserThisFrame && !pinchBlocksPen;
@@ -3135,18 +5683,33 @@ function animate(time, frame) {
   if (currentStrokePainter && !isStrokeActive()) {
     const mesh = currentStrokePainter.mesh;
     mesh.userData.points = currentStrokePointsLocal.map((p) => p.clone());
+    mesh.userData.strokeWidths = currentStrokeWidthsLocal.slice();
+    mesh.userData.strokeWidth =
+      currentStrokeWidthsLocal.length > 0
+        ? currentStrokeWidthsLocal[currentStrokeWidthsLocal.length - 1]
+        : mesh.userData.strokeWidth ??
+          (STROKE_WIDTH_MIN + userStrokeWidthMax) * 0.5;
     delete mesh.userData.centerLocal;
     mesh.userData.syncId = crypto.randomUUID();
+    mesh.userData.strokeColorHex = activeStrokeColorHex;
     sketcharPendingSyncIds.add(mesh.userData.syncId);
+    strokeRedoStack.length = 0;
+    strokeUndoStack.push(mesh);
+    updateStrokeUndoRedoButtons();
     currentStrokePainter = null;
     currentStrokePointsLocal.length = 0;
+    currentStrokeWidthsLocal.length = 0;
     pushCompletedStrokeForBlockMode(mesh);
     scheduleSketcharPush();
     if (sketcharPollDeferred) void flushSketcharRemote();
   }
 
   if (frame && renderer.xr.isPresenting) {
+    /* Scene/world manip must run before hand grab: rear+stylus would otherwise pick a stroke and block canSceneManip(). */
+    handleSceneManip(frame);
     handleHandGrab(frame);
+    updateLeftHandStylusGrabFingerAffordances();
+    handleStylusGrabAuxPinches(frame);
   }
 
   if (stylus && gamepad1 && isEraserHeld()) {
@@ -3156,9 +5719,29 @@ function animate(time, frame) {
   if (frame && renderer.xr.isPresenting) {
     const session = renderer.xr.getSession();
     if (session) updateFingerDebug(frame, session);
+    if (session) updatePickStrokeDebug(frame, session);
+    if (session) {
+      updateWristMenuPose(frame, session);
+      updatePalmMenuPose(frame, session);
+    }
+    if (
+      stylus &&
+      (wristMenuGroup?.visible || palmMenuGroup?.visible)
+    ) {
+      updateWristPalmMenuStylusPointerAssist();
+      processStylusUiPlanePenetration();
+      if (
+        palmWheelDragActive &&
+        palmMenuUvValid &&
+        lastStylusUiMesh === palmHtmlMesh &&
+        !_palmWheelLastDragUv.equals(palmMenuLastUv)
+      ) {
+        _palmWheelLastDragUv.copy(palmMenuLastUv);
+        applyPalmWheelFromUv(palmMenuLastUv.x, palmMenuLastUv.y);
+      }
+    }
     handleGridSnapTogglePinch(frame);
     handleBlockModePinch(frame);
-    handleSceneManip(frame);
     updateRingGridSnapIndicatorSprites();
   }
 
@@ -3187,18 +5770,49 @@ function animate(time, frame) {
       if (refSpace) {
         const pose = frame.getViewerPose(refSpace);
         if (pose) {
+          strokesGroup.updateMatrixWorld(true);
+          strokesGroup.getWorldQuaternion(_strokesWorldQuatForPresence);
           const p = pose.transform.position;
           _questHeadWorld.set(p.x, p.y, p.z);
-          strokesGroup.updateMatrixWorld(true);
           strokesGroup.worldToLocal(_questHeadLocal.copy(_questHeadWorld));
-          sketcharRoomRealtime.sendPresence({
+          const o = pose.transform.orientation;
+          /** @type {{ deviceId: string, label: string, mode: "xr_head", x: number, y: number, z: number, qx?: number, qy?: number, qz?: number, qw?: number, sx?: number, sy?: number, sz?: number, sqx?: number, sqy?: number, sqz?: number, sqw?: number }} */
+          const payload = {
             deviceId: sketcharDeviceId,
             label: defaultPresenceLabel(),
             mode: "xr_head",
             x: _questHeadLocal.x,
             y: _questHeadLocal.y,
             z: _questHeadLocal.z,
-          });
+          };
+          if (o) {
+            _questHeadQuatWorld.set(o.x, o.y, o.z, o.w).normalize();
+            _questHeadLocalQuat
+              .copy(_strokesWorldQuatForPresence)
+              .invert()
+              .multiply(_questHeadQuatWorld);
+            payload.qx = _questHeadLocalQuat.x;
+            payload.qy = _questHeadLocalQuat.y;
+            payload.qz = _questHeadLocalQuat.z;
+            payload.qw = _questHeadLocalQuat.w;
+          }
+          if (stylus) {
+            stylus.getWorldPosition(_stylusWorld);
+            strokesGroup.worldToLocal(_stylusLocal.copy(_stylusWorld));
+            payload.sx = _stylusLocal.x;
+            payload.sy = _stylusLocal.y;
+            payload.sz = _stylusLocal.z;
+            stylus.getWorldQuaternion(_stylusQuatWorld);
+            _stylusLocalQuat
+              .copy(_strokesWorldQuatForPresence)
+              .invert()
+              .multiply(_stylusQuatWorld);
+            payload.sqx = _stylusLocalQuat.x;
+            payload.sqy = _stylusLocalQuat.y;
+            payload.sqz = _stylusLocalQuat.z;
+            payload.sqw = _stylusLocalQuat.w;
+          }
+          sketcharRoomRealtime.sendPresence(payload);
         }
       }
     }
@@ -3223,7 +5837,10 @@ function handleDrawing(controller) {
 
   if (gamepad1) {
     _snapNext.copy(stylus.position);
-    if (snapToGridEnabled) snapWorldPointToGrid(_snapNext);
+    if (snapToGridEnabled) {
+      snapWorldPointToGrid(_snapNext);
+      applyDraftSnapConstraint(_snapNext, _lastStrokeSnapWorld, _snapNext);
+    }
 
     if (isDrawing) {
       const w = getPressureStrokeWidth();
@@ -3231,7 +5848,8 @@ function handleDrawing(controller) {
         emitManhattanSnapSegments(currentStrokePainter, w, _lastStrokeSnapWorld, _snapNext);
       } else {
         cursor.copy(_snapNext);
-        if (currentStrokePointsLocal.length >= STROKE_MAX_POINTS) {
+        const maxSteps = STROKE_MAX_POINTS - currentStrokePointsLocal.length;
+        if (maxSteps <= 0) {
           return;
         }
         if (
@@ -3240,13 +5858,26 @@ function handleDrawing(controller) {
         ) {
           return;
         }
-        currentStrokePainter.setSize(w);
-        currentStrokePainter.mesh.userData.strokeWidth = w;
-        strokeMeshLocalFromWorld(_strokeMeshLocal, cursor);
-        currentStrokePainter.lineTo(_strokeMeshLocal);
-        currentStrokePainter.update();
-        appendStrokePointWorld(cursor);
-        _lastStrokeSampleWorld.copy(cursor);
+        const preW =
+          currentStrokeWidthsLocal.length > 0
+            ? currentStrokeWidthsLocal[currentStrokeWidthsLocal.length - 1]
+            : w;
+        _strokeFreeformFromWorld.copy(_lastStrokeSampleWorld);
+        const d = cursor.distanceTo(_strokeFreeformFromWorld);
+        let steps = Math.max(1, Math.ceil(d / STROKE_FREEFORM_MAX_SEGMENT_M));
+        steps = Math.min(steps, maxSteps);
+        for (let i = 1; i <= steps; i++) {
+          const t = i / steps;
+          _strokeInterpWorld.lerpVectors(_strokeFreeformFromWorld, cursor, t);
+          const wi = preW + (w - preW) * t;
+          currentStrokePainter.setSize(wi);
+          currentStrokePainter.mesh.userData.strokeWidth = wi;
+          strokeMeshLocalFromWorld(_strokeMeshLocal, _strokeInterpWorld);
+          currentStrokePainter.lineTo(_strokeMeshLocal);
+          currentStrokePainter.update();
+          appendStrokePointWorld(_strokeInterpWorld, wi);
+          _lastStrokeSampleWorld.copy(_strokeInterpWorld);
+        }
       }
     } else {
       cursor.copy(_snapNext);
