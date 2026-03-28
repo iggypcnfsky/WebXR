@@ -4632,9 +4632,6 @@ function updateTwoHandGrab(frame, refSpace) {
   /* Lattice alignment on release only (releaseGrab); free transform while pinching. */
   strokesGroup.updateMatrixWorld(true);
   mesh.updateMatrixWorld(true);
-  _pickV.copy(ensureMeshCenterLocal(mesh));
-  mesh.localToWorld(_pickV);
-  thO0.copy(_pickV).sub(thMid);
   refreshStrokeRootForWorldWidth(mesh);
 }
 

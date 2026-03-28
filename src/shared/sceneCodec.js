@@ -12,8 +12,8 @@ import {
   getStrokeMaterialForHex,
 } from "./strokeMaterial.js";
 
-export const STROKE_WIDTH_MIN = 0.04;
-export const STROKE_WIDTH_MAX = 0.2;
+export const STROKE_WIDTH_MIN = 0.02;
+export const STROKE_WIDTH_MAX = 0.5;
 
 /**
  * @param {number} pressure PointerEvent.pressure (0–1); 0.5 if unavailable.
