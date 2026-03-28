@@ -4618,7 +4618,15 @@ function updateTwoHandGrab(frame, refSpace) {
   const centerLocal = ensureMeshCenterLocal(mesh);
   // Pinch distance scales the mesh uniformly; tube thickness is rebuilt to stay constant in world space.
   mesh.scale.setScalar(thBaseScale * s);
-  mesh.quaternion.copy(thQuatMesh0).premultiply(qAlign).premultiply(qTwist);
+  /* thQuatMesh0 is world space from init; mesh.quaternion is parent-local — convert so grab start pose is preserved. */
+  _qWorldGrab.copy(thQuatMesh0).premultiply(qAlign).premultiply(qTwist);
+  if (mesh.parent) {
+    mesh.parent.updateMatrixWorld(true);
+    mesh.parent.getWorldQuaternion(_snapParentQuat);
+    mesh.quaternion.copy(_snapParentQuat).invert().multiply(_qWorldGrab);
+  } else {
+    mesh.quaternion.copy(_qWorldGrab);
+  }
   mesh.position.set(0, 0, 0);
   strokesGroup.updateMatrixWorld(true);
   mesh.updateMatrixWorld(true);
