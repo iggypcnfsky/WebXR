@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import Axis3d from "lucide/dist/esm/icons/axis-3d.js";
 import Boxes from "lucide/dist/esm/icons/boxes.js";
-import Copy from "lucide/dist/esm/icons/copy.js";
+import Layers from "lucide/dist/esm/icons/layers.js";
 import Trash2 from "lucide/dist/esm/icons/trash-2.js";
 import Grid3x3 from "lucide/dist/esm/icons/grid-3x3.js";
 import Link2 from "lucide/dist/esm/icons/link-2.js";
@@ -26,7 +26,7 @@ import {
   createTubePainterSized,
 } from "./misc/TubePainterSized.js";
 import { patchWebXRDepthSensingMeshIfNeeded } from "./misc/xrDepthFeather.js";
-import { HTMLMesh } from "three/examples/jsm/interactive/HTMLMesh.js";
+import { HTMLMesh } from "./misc/HTMLMesh.js";
 import { InteractiveGroup } from "three/examples/jsm/interactive/InteractiveGroup.js";
 import { XRButton } from "three/examples/jsm/webxr/XRButton.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -54,6 +54,10 @@ import {
   exportSketchToGlbArrayBuffer,
   uploadGlbArrayBuffer,
 } from "./shared/glbExport.js";
+import {
+  cloneObject3DSharingGeometry,
+  loadGltfIntoGroup,
+} from "./shared/gltfSceneLoader.js";
 import { normalizeRoomCode } from "./shared/roomCode.js";
 import { loadRoomHistory, rememberRoom } from "./shared/sketcharRoomHistory.js";
 import {
@@ -2148,7 +2152,7 @@ function updateSketcharViewerLink(elViewerLink) {
 }
 
 let currentStrokePainter = null;
-/** Polyline in mesh-local space; copied to mesh.userData.points when stroke ends (for partial erase). */
+/** Polyline in mesh-local space; copied to mesh.userData.points when stroke ends. */
 let currentStrokePointsLocal = [];
 /** Parallel to currentStrokePointsLocal: width for segment ending at vertex i (i>=1); index 0 mirrors stroke start. */
 let currentStrokeWidthsLocal = [];
@@ -2256,7 +2260,6 @@ const _wL0 = new THREE.Vector3();
 const _wR0 = new THREE.Vector3();
 const qTwist = new THREE.Quaternion();
 const _projT = new THREE.Vector3();
-const _eraseWorld = new THREE.Vector3();
 const _axis = new THREE.Vector3();
 const thQuatCombined = new THREE.Quaternion();
 const _centerLocal = new THREE.Vector3();
@@ -2271,6 +2274,34 @@ const _qWorldGrab = new THREE.Quaternion();
 const _qSnapRot = new THREE.Quaternion();
 const _eulerGrabSnap = new THREE.Euler();
 const _snapParentQuat = new THREE.Quaternion();
+/** World delta for duplicate placement along +sceneContentRoot X (see `duplicateWorldDeltaForIndex`). */
+const _dupOriginWorld = new THREE.Vector3();
+const _dupTipWorld = new THREE.Vector3();
+const _dupTargetLocal = new THREE.Vector3();
+/** Meters per duplicate index along scene content +X (local). */
+const DUPLICATE_OFFSET_SCENE_LOCAL = 0.07;
+
+function duplicateWorldDeltaForIndex(ri) {
+  const step = DUPLICATE_OFFSET_SCENE_LOCAL * (ri + 1);
+  sceneContentRoot.updateMatrixWorld(true);
+  _dupOriginWorld.set(0, 0, 0);
+  sceneContentRoot.localToWorld(_dupOriginWorld);
+  _dupTipWorld.set(step, 0, 0);
+  sceneContentRoot.localToWorld(_dupTipWorld);
+  return _dupTipWorld.sub(_dupOriginWorld);
+}
+
+/** @param {THREE.Object3D} root
+ * @param {THREE.Object3D | null} parent
+ * @param {THREE.Vector3} worldDelta
+ * @param {THREE.Vector3} out */
+function duplicateRootLocalPosition(root, parent, worldDelta, out) {
+  root.updateMatrixWorld(true);
+  root.getWorldPosition(out);
+  out.add(worldDelta);
+  (parent || strokesGroup).worldToLocal(out);
+  return out;
+}
 
 const PINCH_CLOSE_DIST = 0.015;
 const PINCH_OPEN_DIST = 0.025;
@@ -2359,8 +2390,6 @@ const STROKE_WIDTH_MAX_STORAGE_KEY = "mxink-stroke-width-max";
 const strokeUndoStack = [];
 /** Detached roots after undo, for redo. */
 const strokeRedoStack = [];
-const ERASE_RADIUS = 0.038;
-const ERASE_RADIUS_SQ = ERASE_RADIUS * ERASE_RADIUS;
 
 /** Voxel resolution along the shortest box edge (min edge / N). */
 const BLOCK_VOXEL_DIV_N = 12;
@@ -3387,6 +3416,14 @@ function initStrokeWidthFromStorage() {
   }
   const valEl = document.getElementById("stroke-width-value");
   if (valEl) valEl.textContent = userStrokeWidthMax.toFixed(3);
+  const smin = parseFloat(slider.min);
+  const smax = parseFloat(slider.max);
+  const span = smax - smin;
+  const pct = span > 1e-9 ? Math.round(((userStrokeWidthMax - smin) / span) * 100) : 0;
+  slider.setAttribute(
+    "aria-valuetext",
+    `${userStrokeWidthMax.toFixed(3)} m max (${pct}%)`,
+  );
 }
 
 function persistStrokeWidthMax() {
@@ -3402,6 +3439,17 @@ function wireStrokeWidthSlider() {
   const valEl = document.getElementById("stroke-width-value");
   if (!slider || !valEl) return;
   valEl.textContent = userStrokeWidthMax.toFixed(3);
+  const syncAria = () => {
+    const smin = parseFloat(slider.min);
+    const smax = parseFloat(slider.max);
+    const span = smax - smin;
+    const pct = span > 1e-9 ? Math.round(((userStrokeWidthMax - smin) / span) * 100) : 0;
+    slider.setAttribute(
+      "aria-valuetext",
+      `${userStrokeWidthMax.toFixed(3)} m max (${pct}%)`,
+    );
+  };
+  syncAria();
   slider.addEventListener("input", () => {
     const t = parseFloat(slider.value);
     if (!Number.isFinite(t)) return;
@@ -3410,6 +3458,7 @@ function wireStrokeWidthSlider() {
       Math.max(STROKE_WIDTH_MIN + 1e-6, t),
     );
     valEl.textContent = userStrokeWidthMax.toFixed(3);
+    syncAria();
     persistStrokeWidthMax();
     forceWristHtmlTextureUpdate();
   });
@@ -4286,7 +4335,7 @@ function updateLeftHandStylusGrabFingerAffordances() {
   lastLeftStylusGrabFingerMode = mode;
   if (!leftRingFingerSprite || !leftPinkyFingerSprite) return;
   if (mode === "stylusGrab") {
-    paintLucideSpriteTexture(leftRingFingerSprite, Copy, {
+    paintLucideSpriteTexture(leftRingFingerSprite, Layers, {
       bgFill: "rgba(0,72,56,0.88)",
       borderStroke: "rgba(140,255,190,0.95)",
     });
@@ -4350,17 +4399,45 @@ function restoreLeftPinkyFingerSpriteDefault() {
 function duplicateGrabbedStrokeRoot() {
   const roots = grabbedGrabRoots.length > 0 ? grabbedGrabRoots.slice() : grabbedMesh ? [grabbedMesh] : [];
   if (roots.length === 0) return;
-  const baseOff = new THREE.Vector3(0.05, 0.05, 0.05);
+  /** @type {THREE.Object3D[]} */
+  const newRoots = [];
   for (let ri = 0; ri < roots.length; ri++) {
     const root = roots[ri];
     const parent = root.parent || strokesGroup;
-    const offset = baseOff.clone().multiplyScalar(ri + 1);
-    if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+    const worldDelta = duplicateWorldDeltaForIndex(ri);
+    if (root.userData && root.userData.isGltfAsset && root.isGroup) {
+      const url = typeof root.userData.gltfUrl === "string" ? root.userData.gltfUrl.trim() : "";
+      const g = new THREE.Group();
+      g.userData.isGltfAsset = true;
+      g.userData.gltfUrl = url;
+      g.userData.syncId = crypto.randomUUID();
+      sketcharPendingSyncIds.add(g.userData.syncId);
+      duplicateRootLocalPosition(root, parent, worldDelta, _dupTargetLocal);
+      g.position.copy(_dupTargetLocal);
+      g.quaternion.copy(root.quaternion);
+      g.scale.copy(root.scale);
+      if (root.userData.gltfLoaded && root.children.length > 0) {
+        g.add(cloneObject3DSharingGeometry(root.children[0]));
+        g.userData.gltfLoaded = true;
+        delete g.userData.gltfLoadError;
+        parent.add(g);
+        delete g.userData.centerLocal;
+        newRoots.push(g);
+      } else if (url) {
+        parent.add(g);
+        void loadGltfIntoGroup(g, url);
+        delete g.userData.centerLocal;
+        console.warn("[gltf] duplicate: asset not loaded yet; finishing async load on copy");
+      } else {
+        g.removeFromParent();
+      }
+    } else if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
       const g = new THREE.Group();
       g.userData.isStrokeCluster = true;
       g.userData.syncId = crypto.randomUUID();
       sketcharPendingSyncIds.add(g.userData.syncId);
-      g.position.copy(root.position).add(offset);
+      duplicateRootLocalPosition(root, parent, worldDelta, _dupTargetLocal);
+      g.position.copy(_dupTargetLocal);
       g.quaternion.copy(root.quaternion);
       g.scale.copy(root.scale);
       for (const ch of root.children) {
@@ -4387,6 +4464,7 @@ function duplicateGrabbedStrokeRoot() {
       }
       parent.add(g);
       invalidateStrokeClusterCenters(g);
+      newRoots.push(g);
     } else if (root.isMesh && root.userData.points && root.userData.points.length >= 2) {
       const pts = root.userData.points.map((p) => p.clone());
       const rootHex =
@@ -4401,44 +4479,56 @@ function duplicateGrabbedStrokeRoot() {
         rootHex,
         root.userData.strokeProfile,
       );
-      nm.position.copy(root.position).add(offset);
+      duplicateRootLocalPosition(root, parent, worldDelta, _dupTargetLocal);
+      nm.position.copy(_dupTargetLocal);
       nm.quaternion.copy(root.quaternion);
       nm.scale.copy(root.scale);
       nm.userData.syncId = crypto.randomUUID();
       sketcharPendingSyncIds.add(nm.userData.syncId);
       parent.add(nm);
       delete nm.userData.centerLocal;
+      newRoots.push(nm);
     }
   }
   scheduleSketcharPush();
+  if (newRoots.length > 0 && grabInputIsStylus && grabMode === "one" && stylus) {
+    beginOneHandGrabWithRoots(newRoots, stylus.position, null, true);
+  }
+}
+
+/** Remove a drawable root (stroke, cluster, voxel mesh, or GLB wrapper) and record Sketchar tombstone. */
+function removeGrabbableRootFromScene(root) {
+  if (!root) return;
+  if (root.userData && root.userData.isGltfAsset && root.isGroup) {
+    recordSketcharDeletionForObject3D(root);
+    const u = typeof root.userData.gltfUrl === "string" ? root.userData.gltfUrl.trim() : "";
+    if (u) {
+      const rawUrl = import.meta.env.VITE_EXPORT_GLB_URL;
+      const rawTok = import.meta.env.VITE_EXPORT_GLB_TOKEN;
+      const exportUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
+      const exportTok = typeof rawTok === "string" ? rawTok.trim() : "";
+      void deleteRoomGlbFromR2(u, { url: exportUrl, token: exportTok });
+    }
+    disposeSceneGeometrySubtree(root);
+    root.removeFromParent();
+    return;
+  }
+  if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
+    recordSketcharDeletionForObject3D(root);
+    root.traverse((o) => {
+      if (o.isMesh && o.geometry) o.geometry.dispose();
+    });
+    root.removeFromParent();
+    return;
+  }
+  removeStrokeMeshFromScene(root);
 }
 
 function deleteGrabbedStrokeRoot() {
   const roots = grabbedGrabRoots.length > 0 ? grabbedGrabRoots.slice() : grabbedMesh ? [grabbedMesh] : [];
   if (roots.length === 0) return;
   for (let ri = 0; ri < roots.length; ri++) {
-    const root = roots[ri];
-    if (root.userData && root.userData.isGltfAsset && root.isGroup) {
-      recordSketcharDeletionForObject3D(root);
-      const u = typeof root.userData.gltfUrl === "string" ? root.userData.gltfUrl.trim() : "";
-      if (u) {
-        const rawUrl = import.meta.env.VITE_EXPORT_GLB_URL;
-        const rawTok = import.meta.env.VITE_EXPORT_GLB_TOKEN;
-        const exportUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
-        const exportTok = typeof rawTok === "string" ? rawTok.trim() : "";
-        void deleteRoomGlbFromR2(u, { url: exportUrl, token: exportTok });
-      }
-      disposeSceneGeometrySubtree(root);
-      root.removeFromParent();
-    } else if (root.userData && root.userData.isStrokeCluster && root.isGroup) {
-      recordSketcharDeletionForObject3D(root);
-      root.traverse((o) => {
-        if (o.isMesh && o.geometry) o.geometry.dispose();
-      });
-      root.removeFromParent();
-    } else {
-      removeStrokeMeshFromScene(root);
-    }
+    removeGrabbableRootFromScene(roots[ri]);
   }
   releaseGrab();
   scheduleSketcharPush();
@@ -5470,113 +5560,6 @@ function invalidateStrokeClusterCenters(node) {
   }
 }
 
-function eraseStrokeAtWorld(mesh, eraseWorldPt) {
-  recordSketcharDeletionForObject3D(mesh);
-  const pts = mesh.userData.points;
-  const strokeWidthsFull = mesh.userData.strokeWidths;
-  const widthsOk =
-    Array.isArray(strokeWidthsFull) &&
-    strokeWidthsFull.length === pts?.length;
-  if (!pts || pts.length < 2) {
-    const parent = mesh.parent;
-    mesh.removeFromParent();
-    mesh.geometry.dispose();
-    if (parent && parent.userData && parent.userData.isStrokeCluster) {
-      invalidateStrokeClusterCenters(parent);
-      dissolveStrokeClusterIfSingleton(parent);
-    }
-    scheduleSketcharPush();
-    return;
-  }
-
-  const keep = [];
-  for (let i = 0; i < pts.length; i++) {
-    _pickV.copy(pts[i]);
-    mesh.localToWorld(_pickV);
-    keep.push(_pickV.distanceToSquared(eraseWorldPt) > ERASE_RADIUS_SQ);
-  }
-
-  const runs = [];
-  /** @type {number[][]} */
-  const runWidths = [];
-  let start = -1;
-  for (let i = 0; i < keep.length; i++) {
-    if (keep[i]) {
-      if (start < 0) start = i;
-    } else {
-      if (start >= 0 && i - start >= 2) {
-        runs.push(pts.slice(start, i));
-        if (widthsOk) {
-          runWidths.push(strokeWidthsFull.slice(start, i));
-        }
-      }
-      start = -1;
-    }
-  }
-  if (start >= 0 && keep.length - start >= 2) {
-    runs.push(pts.slice(start));
-    if (widthsOk) {
-      runWidths.push(strokeWidthsFull.slice(start));
-    }
-  }
-
-  if (runs.length === 0) {
-    const parent = mesh.parent;
-    mesh.removeFromParent();
-    mesh.geometry.dispose();
-    if (parent && parent.userData && parent.userData.isStrokeCluster) {
-      invalidateStrokeClusterCenters(parent);
-      dissolveStrokeClusterIfSingleton(parent);
-    }
-    scheduleSketcharPush();
-    return;
-  }
-
-  const pos = mesh.position.clone();
-  const quat = mesh.quaternion.clone();
-  const sc = mesh.scale.clone();
-
-  const eraseParent = mesh.parent;
-  mesh.removeFromParent();
-  mesh.geometry.dispose();
-
-  const sw = mesh.userData.strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
-  const addTo = eraseParent && eraseParent.userData && eraseParent.userData.isStrokeCluster ? eraseParent : strokesGroup;
-  for (let ri = 0; ri < runs.length; ri++) {
-    const run = runs[ri];
-    const localPts = run.map((p) => p.clone());
-    const rw =
-      widthsOk && runWidths[ri] && runWidths[ri].length === localPts.length
-        ? runWidths[ri]
-        : null;
-    const splitColorHex =
-      typeof mesh.userData.strokeColorHex === "number" &&
-      Number.isFinite(mesh.userData.strokeColorHex)
-        ? mesh.userData.strokeColorHex >>> 0
-        : DEFAULT_STROKE_COLOR_HEX;
-    const newMesh = buildStrokeMeshFromPoints(
-      localPts,
-      sw,
-      rw,
-      splitColorHex,
-      mesh.userData.strokeProfile,
-    );
-    newMesh.position.copy(pos);
-    newMesh.quaternion.copy(quat);
-    newMesh.scale.copy(sc);
-    newMesh.userData.points = localPts.map((p) => p.clone());
-    const splitId = crypto.randomUUID();
-    newMesh.userData.syncId = splitId;
-    sketcharPendingSyncIds.add(splitId);
-    addTo.add(newMesh);
-  }
-  if (eraseParent && eraseParent.userData && eraseParent.userData.isStrokeCluster) {
-    invalidateStrokeClusterCenters(eraseParent);
-    dissolveStrokeClusterIfSingleton(eraseParent);
-  }
-  scheduleSketcharPush();
-}
-
 function dissolveStrokeClusterIfSingleton(cluster) {
   if (!cluster.userData || !cluster.userData.isStrokeCluster) return;
   if (cluster.children.length === 0) {
@@ -5599,21 +5582,9 @@ function handleEraseWithStylus() {
   if (grabMode !== "none") return;
   const hit = pickStrokeMeshFromStylusTip();
   if (!hit) return;
-  _eraseWorld.copy(stylus.position);
-  if (hit.userData.points && hit.userData.points.length >= 2) {
-    eraseStrokeAtWorld(hit, _eraseWorld);
-  } else {
-    const parent = hit.parent;
-    recordSketcharDeletionForObject3D(hit);
-    hit.removeFromParent();
-    hit.geometry.dispose();
-    /* Stroke materials are shared/cached — dispose geometry only. */
-    if (parent && parent.userData && parent.userData.isStrokeCluster) {
-      invalidateStrokeClusterCenters(parent);
-      dissolveStrokeClusterIfSingleton(parent);
-    }
-    scheduleSketcharPush();
-  }
+  const root = getStrokeGrabRoot(hit);
+  removeGrabbableRootFromScene(root);
+  scheduleSketcharPush();
 }
 
 function pushCompletedStrokeForBlockMode(mesh) {

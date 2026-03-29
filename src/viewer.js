@@ -868,6 +868,12 @@ function snapshotContentFingerprint(snapshot) {
     const id = typeof n.id === "string" ? n.id : "";
     const t = n.t || "";
     h ^= id.length * 73856093 + t.length * 19349663;
+    if (t === "gltf" && typeof n.url === "string") {
+      const u = n.url;
+      for (let j = 0; j < Math.min(u.length, 64); j++) {
+        h = Math.imul(h ^ u.charCodeAt(j), 0x01000193);
+      }
+    }
     const pts = n.points;
     if (Array.isArray(pts)) {
       h ^= pts.length * 83492791;

@@ -1,3 +1,4 @@
+import * as THREE from "three";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
@@ -20,6 +21,106 @@ function disposeSubtreeGeometry(root) {
       g.dispose();
     }
   });
+}
+
+/**
+ * Deep-clone scene graph while reusing BufferGeometry and Materials (extra “instances” without re-upload).
+ * SkinnedMesh / skeleton-heavy nodes use full `clone(true)` so bones stay consistent.
+ * @param {THREE.Object3D} source
+ * @returns {THREE.Object3D}
+ */
+export function cloneObject3DSharingGeometry(source) {
+  if (source.isSkinnedMesh) {
+    return /** @type {THREE.SkinnedMesh} */ (source.clone(true));
+  }
+  if (source.isMesh) {
+    const mesh = new THREE.Mesh(source.geometry, source.material);
+    mesh.name = source.name;
+    mesh.position.copy(source.position);
+    mesh.quaternion.copy(source.quaternion);
+    mesh.scale.copy(source.scale);
+    mesh.visible = source.visible;
+    mesh.castShadow = source.castShadow;
+    mesh.receiveShadow = source.receiveShadow;
+    mesh.renderOrder = source.renderOrder;
+    mesh.frustumCulled = source.frustumCulled;
+    Object.assign(mesh.userData, source.userData);
+    for (let i = 0; i < source.children.length; i++) {
+      mesh.add(cloneObject3DSharingGeometry(source.children[i]));
+    }
+    return mesh;
+  }
+  if (source.isLineSegments) {
+    const line = new THREE.LineSegments(source.geometry, source.material);
+    line.name = source.name;
+    line.position.copy(source.position);
+    line.quaternion.copy(source.quaternion);
+    line.scale.copy(source.scale);
+    line.visible = source.visible;
+    Object.assign(line.userData, source.userData);
+    for (let i = 0; i < source.children.length; i++) {
+      line.add(cloneObject3DSharingGeometry(source.children[i]));
+    }
+    return line;
+  }
+  if (source.isLine) {
+    const line = new THREE.Line(source.geometry, source.material);
+    line.name = source.name;
+    line.position.copy(source.position);
+    line.quaternion.copy(source.quaternion);
+    line.scale.copy(source.scale);
+    line.visible = source.visible;
+    Object.assign(line.userData, source.userData);
+    for (let i = 0; i < source.children.length; i++) {
+      line.add(cloneObject3DSharingGeometry(source.children[i]));
+    }
+    return line;
+  }
+  if (source.isPoints) {
+    const pts = new THREE.Points(source.geometry, source.material);
+    pts.name = source.name;
+    pts.position.copy(source.position);
+    pts.quaternion.copy(source.quaternion);
+    pts.scale.copy(source.scale);
+    pts.visible = source.visible;
+    Object.assign(pts.userData, source.userData);
+    for (let i = 0; i < source.children.length; i++) {
+      pts.add(cloneObject3DSharingGeometry(source.children[i]));
+    }
+    return pts;
+  }
+  if (source.isInstancedMesh) {
+    const inst = new THREE.InstancedMesh(
+      source.geometry,
+      source.material,
+      source.count,
+    );
+    inst.name = source.name;
+    inst.position.copy(source.position);
+    inst.quaternion.copy(source.quaternion);
+    inst.scale.copy(source.scale);
+    inst.visible = source.visible;
+    inst.instanceMatrix.copy(source.instanceMatrix);
+    inst.instanceMatrix.needsUpdate = true;
+    if (source.instanceColor)
+      inst.instanceColor = source.instanceColor.clone();
+    Object.assign(inst.userData, source.userData);
+    for (let i = 0; i < source.children.length; i++) {
+      inst.add(cloneObject3DSharingGeometry(source.children[i]));
+    }
+    return inst;
+  }
+  const group = new THREE.Group();
+  group.name = source.name;
+  group.position.copy(source.position);
+  group.quaternion.copy(source.quaternion);
+  group.scale.copy(source.scale);
+  group.visible = source.visible;
+  Object.assign(group.userData, source.userData);
+  for (let i = 0; i < source.children.length; i++) {
+    group.add(cloneObject3DSharingGeometry(source.children[i]));
+  }
+  return group;
 }
 
 /**

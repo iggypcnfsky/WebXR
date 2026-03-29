@@ -576,6 +576,91 @@ body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .
 .sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke {
     padding-top: 10px;
     padding-bottom: 14px;
+    position: relative;
+}
+
+/* Stroke max: vertical column (Figma); baked appearance comes from src/misc/HTMLMesh.js */
+#stroke-width-controls .stroke-width-slider-column {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+}
+
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"] {
+    -webkit-appearance: none;
+    appearance: none;
+    display: block;
+    width: 123px;
+    max-width: none;
+    height: 483px;
+    margin: 4px auto 2px;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
+    box-sizing: border-box;
+}
+
+/* Desktop / lobby: vertical native range (XR wrist uses HTMLMesh canvas draw, not these) */
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"] {
+    writing-mode: vertical-lr;
+    direction: rtl;
+}
+
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"]::-webkit-slider-runnable-track {
+    width: 56px;
+    height: 100%;
+    border-radius: 28px;
+    background: #121212;
+    border: 1px solid #000000;
+}
+
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 102px;
+    height: 102px;
+    margin-left: -23px;
+    border-radius: 50%;
+    background: #c8c8c8;
+    border: 1px solid #000000;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"]::-moz-range-track {
+    width: 56px;
+    height: 100%;
+    border-radius: 28px;
+    background: #121212;
+    border: 1px solid #000000;
+}
+
+#stroke-width-controls #stroke-width-slider[data-slider-orientation="vertical"]::-moz-range-thumb {
+    width: 102px;
+    height: 102px;
+    border-radius: 50%;
+    background: #c8c8c8;
+    border: 1px solid #000000;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+
+#stroke-width-controls .stroke-width-readout {
+    font-size: 12px;
+    opacity: 0.9;
+    text-align: center;
+}
+
+.sketchar-advanced--xr-source #stroke-width-controls .stroke-width-readout {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }
 
 .sketchar-advanced--xr-source .grid-controls label {
@@ -585,8 +670,8 @@ body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .
     gap: 6px;
 }
 
-/* Horizontal range only (HTMLMesh htmlevent uses offsetX/width); thick track + thumb for XR hit targets */
-.sketchar-advanced--xr-source .grid-controls input[type="range"] {
+/* Grid cell: horizontal range (HTMLMesh offsetX/width); thick track + thumb for XR hit targets */
+.sketchar-advanced--xr-source #grid-controls input[type="range"] {
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
@@ -598,14 +683,14 @@ body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .
     box-sizing: border-box;
 }
 
-.sketchar-advanced--xr-source .grid-controls input[type="range"]::-webkit-slider-runnable-track {
+.sketchar-advanced--xr-source #grid-controls input[type="range"]::-webkit-slider-runnable-track {
     height: 14px;
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.12);
     border: 1px solid rgba(255, 255, 255, 0.2);
 }
 
-.sketchar-advanced--xr-source .grid-controls input[type="range"]::-webkit-slider-thumb {
+.sketchar-advanced--xr-source #grid-controls input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
     width: 28px;
@@ -617,47 +702,20 @@ body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
 }
 
-.sketchar-advanced--xr-source .grid-controls input[type="range"]::-moz-range-track {
+.sketchar-advanced--xr-source #grid-controls input[type="range"]::-moz-range-track {
     height: 14px;
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.12);
     border: 1px solid rgba(255, 255, 255, 0.2);
 }
 
-.sketchar-advanced--xr-source .grid-controls input[type="range"]::-moz-range-thumb {
+.sketchar-advanced--xr-source #grid-controls input[type="range"]::-moz-range-thumb {
     width: 28px;
     height: 28px;
     border-radius: 50%;
     background: linear-gradient(165deg, rgba(130, 175, 255, 0.95), rgba(70, 110, 210, 0.98));
     border: 2px solid rgba(255, 255, 255, 0.35);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-}
-
-/* Stroke max: very large vertical hit area + thick track (granular step 0.001 in HTML) */
-.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"] {
-    height: 112px;
-    margin: 8px 0 6px;
-}
-
-.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-webkit-slider-runnable-track {
-    height: 56px;
-    border-radius: 12px;
-}
-
-.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-webkit-slider-thumb {
-    width: 44px;
-    height: 44px;
-    margin-top: 6px;
-}
-
-.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-moz-range-track {
-    height: 56px;
-    border-radius: 12px;
-}
-
-.sketchar-advanced--xr-source #stroke-width-controls.grid-controls--stroke input[type="range"]::-moz-range-thumb {
-    width: 44px;
-    height: 44px;
 }
 
 .sketchar-row {
@@ -733,6 +791,11 @@ body.sketchar-debug-wrist-hits #sketchar-advanced.sketchar-advanced--xr-source .
 .grid-controls input[type="range"] {
     width: min(200px, 100%);
     vertical-align: middle;
+}
+
+#stroke-width-controls.grid-controls--stroke {
+    flex-direction: column;
+    align-items: stretch;
 }
 
 .grid-controls-unit {

@@ -14,6 +14,15 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: repoRoot,
   /** WASM / native deps read from node_modules at runtime (Walden GLB optimizer). */
   serverExternalPackages: ["@loaders.gl/textures", "draco3d", "sharp"],
+  /**
+   * Serve Vite-built `public/index.html` at `/` (synced from `dist/` before `next build`).
+   * Runs before App Router so we do not need `app/page.tsx` for the main WebXR entry.
+   */
+  async rewrites() {
+    return {
+      beforeFiles: [{ source: "/", destination: "/index.html" }],
+    };
+  },
 };
 
 export default nextConfig;

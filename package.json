@@ -3,10 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "workspaces": [
+    "next-upload-api"
+  ],
   "scripts": {
     "dev": "vite",
     "dev:all": "concurrently -n vite,api -c cyan,magenta \"npm run dev\" \"npm run upload-api:dev\"",
     "build": "vite build",
+    "build:vercel": "vite build && node next-upload-api/scripts/sync-vite-dist.mjs && npm run build -w next-upload-api",
     "upload-api:dev": "npm run dev --prefix next-upload-api"
   },
   "devDependencies": {

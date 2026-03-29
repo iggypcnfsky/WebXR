@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
-import { HTMLMesh } from "three/examples/jsm/interactive/HTMLMesh.js";
+import { HTMLMesh } from "../misc/HTMLMesh.js";
 
 const DEVICE_ID_KEY = "sketchar_device_id";
 const SHOW_OTHERS_KEY = "sketchar_show_others";
