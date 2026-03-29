@@ -142,6 +142,7 @@ export function createGridBoxStrokePainter(maxVertices) {
 
   const mesh = new Mesh(geometry, material);
   mesh.frustumCulled = false;
+  mesh.castShadow = true;
 
   const color = new Color(0xffffff);
   let size = 1;

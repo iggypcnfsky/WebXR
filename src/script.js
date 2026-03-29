@@ -88,6 +88,8 @@ import {
 } from "./shared/sketcharSupabase.js";
 
 let camera, scene, renderer;
+/** @type {THREE.DirectionalLight | null} */
+let sketcharSunLight = null;
 let controller1, controller2;
 let controller3, controller4;
 /** @type {THREE.Group[]} Target-ray groups used for wrist HTMLMesh XR interaction (slots 0–3). */
@@ -111,6 +113,8 @@ sceneContentRoot.name = "scene-content-root";
 let originGizmoGroup = null;
 /** @type {THREE.GridHelper | null} */
 let originFloorGrid = null;
+/** @type {THREE.Mesh | null} */
+let originShadowFloor = null;
 let showOriginFloor = true;
 /** Debug: wireframe sphere + ray at index tip matching `pickStrokeMesh` reach. */
 let showPickStrokeDebug = false;
@@ -2381,9 +2385,12 @@ const CLUSTER_MIDDLE_DRAW_THRESHOLD = 0.22;
 /** cluster_front_logitech/click — light press activates eraser (boolean / short travel). */
 const CLUSTER_FRONT_ERASER_ACTIVATE = 0.02;
 const STROKE_WIDTH_MIN = 0.04;
-const STROKE_WIDTH_MAX = 0.2;
+/** Wrist slider upper bound (m); min stays STROKE_WIDTH_MIN. */
+const STROKE_WIDTH_SLIDER_MAX = 20;
+/** Default midpoint when stroke width is missing from serialized/rebuild data (legacy 0.04–0.2 range). */
+const STROKE_WIDTH_DEFAULT_MID = (STROKE_WIDTH_MIN + 0.2) * 0.5;
 /** Upper bound for pressure mapping; slider-adjustable (min stays STROKE_WIDTH_MIN). */
-let userStrokeWidthMax = STROKE_WIDTH_MAX;
+let userStrokeWidthMax = 0.2;
 const STROKE_WIDTH_MAX_STORAGE_KEY = "mxink-stroke-width-max";
 
 /** LIFO completed stroke roots for wrist undo (meshes still in `strokesGroup`). */
@@ -2550,6 +2557,21 @@ function initOriginGizmoAndFloor() {
   originFloorGrid.renderOrder = -5;
   originFloorGrid.visible = showOriginFloor;
   originGizmoGroup.add(originFloorGrid);
+
+  const shadowFloorGeom = new THREE.PlaneGeometry(
+    ORIGIN_FLOOR_GRID_SIZE,
+    ORIGIN_FLOOR_GRID_SIZE,
+  );
+  const shadowFloorMat = new THREE.ShadowMaterial({ opacity: 0.33 });
+  originShadowFloor = new THREE.Mesh(shadowFloorGeom, shadowFloorMat);
+  originShadowFloor.name = "origin-shadow-floor";
+  originShadowFloor.rotation.x = -Math.PI / 2;
+  originShadowFloor.receiveShadow = true;
+  originShadowFloor.renderOrder = -6;
+  originShadowFloor.visible = showOriginFloor;
+  originShadowFloor.raycast = () => {};
+  originGizmoGroup.add(originShadowFloor);
+
   originGizmoGroup.traverse((o) => {
     if (o.isLineSegments) o.raycast = () => {};
   });
@@ -2561,6 +2583,7 @@ function syncOriginGizmoVisibility() {
   if (!originGizmoGroup || !renderer) return;
   originGizmoGroup.visible = renderer.xr.isPresenting;
   if (originFloorGrid) originFloorGrid.visible = showOriginFloor;
+  if (originShadowFloor) originShadowFloor.visible = showOriginFloor;
 }
 
 init();
@@ -3406,7 +3429,7 @@ function initStrokeWidthFromStorage() {
     const raw = localStorage.getItem(STROKE_WIDTH_MAX_STORAGE_KEY);
     if (raw != null) {
       const v = parseFloat(raw);
-      if (Number.isFinite(v) && v >= STROKE_WIDTH_MIN && v <= STROKE_WIDTH_MAX) {
+      if (Number.isFinite(v) && v >= STROKE_WIDTH_MIN && v <= STROKE_WIDTH_SLIDER_MAX) {
         userStrokeWidthMax = v;
         slider.value = String(v);
       }
@@ -3454,7 +3477,7 @@ function wireStrokeWidthSlider() {
     const t = parseFloat(slider.value);
     if (!Number.isFinite(t)) return;
     userStrokeWidthMax = Math.min(
-      STROKE_WIDTH_MAX,
+      STROKE_WIDTH_SLIDER_MAX,
       Math.max(STROKE_WIDTH_MIN + 1e-6, t),
     );
     valEl.textContent = userStrokeWidthMax.toFixed(3);
@@ -3718,11 +3741,25 @@ function init() {
   wireStrokeWidthSlider();
   persistGridLatticeDivisions();
 
-  scene.add(new THREE.HemisphereLight(0x888877, 0x777788, 3));
+  scene.add(new THREE.HemisphereLight(0x888877, 0x777788, 2.2));
 
-  const light = new THREE.DirectionalLight(0xffffff, 1.5);
-  light.position.set(0, 4, 0);
-  scene.add(light);
+  sketcharSunLight = new THREE.DirectionalLight(0xffffff, 1.5);
+  sketcharSunLight.position.set(4, 9, 5);
+  sketcharSunLight.castShadow = true;
+  sketcharSunLight.shadow.mapSize.set(1024, 1024);
+  sketcharSunLight.shadow.bias = -0.0002;
+  sketcharSunLight.shadow.normalBias = 0.02;
+  {
+    const sc = sketcharSunLight.shadow.camera;
+    sc.near = 0.1;
+    sc.far = 50;
+    sc.left = -12;
+    sc.right = 12;
+    sc.top = 12;
+    sc.bottom = -12;
+  }
+  scene.add(sketcharSunLight);
+  scene.add(sketcharSunLight.target);
 
   const dbgGeom = new THREE.SphereGeometry(0.007, 10, 10);
   function addHandFingerMarkers(targetArr, handName) {
@@ -3792,6 +3829,8 @@ function init() {
   updateRingGridSnapIndicatorSprites();
 
   renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   setPresenceLabelRenderer(renderer);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(sizes.width, sizes.height);
@@ -5375,7 +5414,7 @@ function buildStrokeMeshFromPoints(
   strokeColorHex,
   strokeProfile,
 ) {
-  const fallback = strokeWidth ?? (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
+  const fallback = strokeWidth ?? STROKE_WIDTH_DEFAULT_MID;
   const hex =
     typeof strokeColorHex === "number" && Number.isFinite(strokeColorHex)
       ? strokeColorHex >>> 0
@@ -5482,8 +5521,7 @@ function refreshStrokeTubeGeometryForWorldWidth(mesh) {
   if (!pts || pts.length < 2) return;
 
   const canonicalStrokeWidth =
-    mesh.userData.strokeWidth ??
-    (STROKE_WIDTH_MIN + STROKE_WIDTH_MAX) * 0.5;
+    mesh.userData.strokeWidth ?? STROKE_WIDTH_DEFAULT_MID;
   const canonicalWidths = mesh.userData.strokeWidths;
   const widthsOk =
     Array.isArray(canonicalWidths) &&

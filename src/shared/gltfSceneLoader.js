@@ -155,6 +155,19 @@ export function loadGltfIntoGroup(group, url) {
         group.remove(ch);
       }
       group.add(gltf.scene);
+      gltf.scene.traverse((o) => {
+        if (o.isMesh || o.isInstancedMesh) {
+          let opaque = true;
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          for (const m of mats) {
+            if (m && m.transparent) {
+              opaque = false;
+              break;
+            }
+          }
+          if (opaque) o.castShadow = true;
+        }
+      });
       group.userData.gltfLoaded = true;
       delete group.userData.centerLocal;
     })

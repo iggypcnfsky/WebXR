@@ -419,6 +419,15 @@ export function preloadPresenceStylusModel(url = SKETCHAR_PRESENCE_STYLUS_GLB_UR
 }
 
 /**
+ * @param {THREE.Object3D} root
+ */
+function markPresenceGltfMeshesCastShadow(root) {
+  root.traverse((o) => {
+    if (o.isMesh) o.castShadow = true;
+  });
+}
+
+/**
  * @param {THREE.Group} group
  */
 function clonePresenceHeadVisual(group) {
@@ -427,6 +436,7 @@ function clonePresenceHeadVisual(group) {
   head.name = "presence-head-gltf";
   group.add(head);
   applyPresenceHeadMaterialHints(head);
+  markPresenceGltfMeshesCastShadow(head);
   return true;
 }
 
@@ -439,6 +449,7 @@ function clonePresenceStylusVisual(group) {
   pen.name = "presence-stylus-gltf";
   group.add(pen);
   applyPresenceHeadMaterialHints(pen);
+  markPresenceGltfMeshesCastShadow(pen);
   return true;
 }
 

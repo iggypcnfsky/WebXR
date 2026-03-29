@@ -67,6 +67,7 @@ export function createTubePainterSized(maxVertices, options = {}) {
 
   const mesh = new Mesh(geometry, material);
   mesh.frustumCulled = false;
+  mesh.castShadow = true;
 
   function getPoints(size) {
     const PI2 = Math.PI * 2;

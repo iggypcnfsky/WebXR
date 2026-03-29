@@ -268,6 +268,8 @@ const renderer = new THREE.WebGLRenderer({
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, isMobileViewer ? 1.25 : 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x1a1e28, 1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 /* iPhone Safari: initializing the WebXR stack with xr.enabled=true is a common crash/OOM source; orbit + drawing don't need it (AR is unsupported on iOS anyway). */
 const viewerIosPhone = /iPhone|iPod/i.test(navigator.userAgent || "");
 renderer.xr.enabled = !viewerIosPhone;
@@ -340,6 +342,19 @@ viewerOriginGizmoGroup.userData.preserveInSceneApply = true;
   originFloorGrid.visible = viewerOriginFloorVisible;
   viewerOriginGizmoGroup.add(originFloorGrid);
   viewerOriginGizmoGroup.userData.originFloorGrid = originFloorGrid;
+
+  const originShadowFloor = new THREE.Mesh(
+    new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE),
+    new THREE.ShadowMaterial({ opacity: 0.33 }),
+  );
+  originShadowFloor.name = "viewer-origin-shadow-floor";
+  originShadowFloor.rotation.x = -Math.PI / 2;
+  originShadowFloor.receiveShadow = true;
+  originShadowFloor.renderOrder = -6;
+  originShadowFloor.visible = viewerOriginFloorVisible;
+  originShadowFloor.raycast = () => {};
+  viewerOriginGizmoGroup.add(originShadowFloor);
+  viewerOriginGizmoGroup.userData.originShadowFloor = originShadowFloor;
 }
 viewerOriginGizmoGroup.traverse((o) => {
   if (o.isMesh || o.isLineSegments) o.raycast = () => {};
@@ -349,8 +364,11 @@ contentGroup.add(viewerOriginGizmoGroup);
 try {
   window.addEventListener("storage", (e) => {
     if (e.key !== ORIGIN_FLOOR_STORAGE_KEY) return;
+    const vis = e.newValue !== "0";
     const grid = viewerOriginGizmoGroup.userData.originFloorGrid;
-    if (grid) grid.visible = e.newValue !== "0";
+    if (grid) grid.visible = vis;
+    const floor = viewerOriginGizmoGroup.userData.originShadowFloor;
+    if (floor) floor.visible = vis;
   });
 } catch (_) {
   /* ignore */
@@ -399,10 +417,24 @@ const _followCamUpWorld = new THREE.Vector3();
 const _presenceSizeScratch = new THREE.Vector3();
 const _presenceStrokeBounds = new THREE.Box3();
 
-scene.add(new THREE.HemisphereLight(0x8899aa, 0x445566, 2.5));
+scene.add(new THREE.HemisphereLight(0x8899aa, 0x445566, 2.2));
 const dl = new THREE.DirectionalLight(0xffffff, 1.2);
-dl.position.set(2, 6, 3);
+dl.position.set(4, 9, 5);
+dl.castShadow = true;
+dl.shadow.mapSize.set(1024, 1024);
+dl.shadow.bias = -0.0002;
+dl.shadow.normalBias = 0.02;
+{
+  const sc = dl.shadow.camera;
+  sc.near = 0.1;
+  sc.far = 50;
+  sc.left = -12;
+  sc.right = 12;
+  sc.top = 12;
+  sc.bottom = -12;
+}
 scene.add(dl);
+scene.add(dl.target);
 
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 0, 0);

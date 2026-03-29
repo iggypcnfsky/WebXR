@@ -758,6 +758,7 @@ function buildNode(node, material) {
       strokeProfile,
     );
     applyTr(mesh, node.tr);
+    mesh.castShadow = true;
     mesh.userData.syncId =
       node.id && typeof node.id === "string"
         ? node.id
@@ -795,6 +796,7 @@ function buildNode(node, material) {
     }
     inst.instanceMatrix.needsUpdate = true;
     inst.computeBoundingSphere();
+    inst.castShadow = true;
     inst.userData.syncId =
       node.id && typeof node.id === "string"
         ? node.id
